@@ -1,0 +1,732 @@
+<script>
+	import { onMount, onDestroy } from 'svelte';
+	import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide } from 'd3-force';
+	import { connectMIDI, selectDevice, requestPull, sendDeleteNode, sendDeleteLink, sendAddLink, sendNoteOn, sendSetScale, sendSetAutoInterval } from '$lib/midi.js';
+	import {
+		graphNodes, graphLinks, currentNodeId, currentNode2Id, nodeCount,
+		knobMain, knobX, knobY, switchState,
+		midiConnected, deviceNames, selectedDevice, scaleIndex, autoInterval
+	} from '$lib/stores.js';
+
+	// ═══════════════════════════════════════════════════════════
+	// Color scheme — easy to change later
+	// ═══════════════════════════════════════════════════════════
+	const COLORS = {
+		bg:          '#08080f',
+		network:     '#9b59b6',     // purple — default star/link
+		chain1:      '#00e5ff',     // cyan — chain 1
+		chain2:      '#d4ff00',     // neon yellow — chain 2
+		focus:       '#ff9500',     // orange — focused node
+		focusTarget: '#ffcc44',     // gold — focused targets
+		glass:       'rgba(12, 12, 20, 0.75)',
+		glassBorder: 'rgba(155, 89, 182, 0.25)',
+		danger:      '#ff4444',
+		connected:   '#5c5',
+		textDim:     'rgba(180, 160, 200, 0.6)',
+	};
+
+	const TRAVEL_DUR = 120;   // ms for dot to travel between nodes
+	const FLASH_DUR  = 200;   // ms for flash to fade (quick pop)
+	const STAR_HIT_R = 18;    // invisible hit area radius
+
+	function handleDeviceChange(e) { selectDevice(e.target.value); }
+
+	let WIDTH = 900;
+	let HEIGHT = 600;
+
+	let displayNodes = [];
+	let displayLinks = [];
+	let simulation = null;
+
+	let dragNode = null;
+	let didDrag = false;
+	let svgEl = null;
+	let containerEl = null;
+
+	let contextMenu = null;
+	let connectFromNode = null;
+	let focusedNodeId = null;
+
+	const positionMap = new Map();
+	let simNodes = [];
+
+	// ═══════════════════════════════════════════════════════════
+	// Star shape
+	// ═══════════════════════════════════════════════════════════
+	function starPath(cx, cy, pitch) {
+		const pitchNorm = pitch / 4095;
+		const points = 4;
+		const outerR = 3 + pitchNorm * 8;                    // 4 → 12
+		const innerRatio = 0.6 - pitchNorm * 0.68;          // 0.88 → 0.20
+		const innerR = outerR * innerRatio;
+		const step = Math.PI / points;
+		let d = '';
+		for (let i = 0; i < 2 * points; i++) {
+			const r = i % 2 === 0 ? outerR : innerR;
+			const angle = i * step - Math.PI / 2;
+			const x = cx + r * Math.cos(angle);
+			const y = cy + r * Math.sin(angle);
+			d += (i === 0 ? 'M' : 'L') + `${x.toFixed(1)} ${y.toFixed(1)} `;
+		}
+		return d + 'Z';
+	}
+
+	// ═══════════════════════════════════════════════════════════
+	// Pitch helpers
+	// ═══════════════════════════════════════════════════════════
+	const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+
+	function quantizeMidi(midiNote, scaleIdx) {
+		const intervals = SCALE_INTERVALS[scaleIdx];
+		if (!intervals || intervals.length >= 12) return midiNote;
+		const octave = Math.floor(midiNote / 12);
+		const degree = ((midiNote % 12) + 12) % 12;
+		let best = intervals[0], bestDist = 99;
+		for (const n of intervals) {
+			const d = Math.abs(degree - n);
+			const dist = Math.min(d, 12 - d);
+			if (dist < bestDist) { bestDist = dist; best = n; }
+		}
+		return octave * 12 + best;
+	}
+
+	function pitchToMidi(pitch) { return Math.round(36 + (pitch * 60) / 4096); }
+
+	function midiToName(midi) {
+		return NOTE_NAMES[((midi % 12) + 12) % 12] + (Math.floor(midi / 12) - 1);
+	}
+
+	function rawPitchToNote(pitch) { return midiToName(pitchToMidi(pitch)); }
+
+	// Compute labels reactively — always show quantized note name
+	function computeLabels(nodes, si) {
+		return new Map(nodes.map(n => {
+			const midi = quantizeMidi(pitchToMidi(n.pitch), si);
+			return [n.id, midiToName(midi)];
+		}));
+	}
+
+	function pitchBrightness(pitch) { return 0.3 + 0.7 * (pitch / 4095); }
+
+	function pitchColor(pitch, baseHex) {
+		const factor = pitchBrightness(pitch);
+		const r = parseInt(baseHex.slice(1, 3), 16);
+		const g = parseInt(baseHex.slice(3, 5), 16);
+		const b = parseInt(baseHex.slice(5, 7), 16);
+		// Blend toward white so stars look like they emit light
+		const mix = (c) => Math.min(255, Math.round(c + (255 - c) * factor * 0.55));
+		return `rgb(${mix(r)}, ${mix(g)}, ${mix(b)})`;
+	}
+
+	// ═══════════════════════════════════════════════════════════
+	// Force simulation
+	// ═══════════════════════════════════════════════════════════
+	function updateSimulation(nodes, links) {
+		if (simulation) simulation.stop();
+		simNodes = nodes.map((n) => {
+			const existing = positionMap.get(n.id);
+			return {
+				id: n.id, pitch: n.pitch,
+				x: existing?.x ?? WIDTH / 2 + (Math.random() - 0.5) * 100,
+				y: existing?.y ?? HEIGHT / 2 + (Math.random() - 0.5) * 100
+			};
+		});
+		const simLinks = links.map((l) => ({
+			source: simNodes.find((n) => n.id === l.source),
+			target: simNodes.find((n) => n.id === l.target),
+			weight: l.weight, sourceId: l.source, targetId: l.target
+		})).filter((l) => l.source && l.target);
+
+		simulation = forceSimulation(simNodes)
+			.force('link', forceLink(simLinks).id((d) => d.id).distance(120).strength(0.2))
+			.force('charge', forceManyBody().strength(-180))
+			.force('center', forceCenter(WIDTH / 2, HEIGHT / 2))
+			.force('collide', forceCollide(24))
+			.alphaDecay(0.05)
+			.on('tick', () => {
+				displayNodes = simNodes.map((n) => ({ id: n.id, pitch: n.pitch, x: n.x, y: n.y }));
+				displayLinks = simLinks.map((l) => ({
+					sourceId: l.sourceId, targetId: l.targetId,
+					x1: l.source.x, y1: l.source.y,
+					x2: l.target.x, y2: l.target.y,
+					weight: l.weight
+				}));
+				displayNodes.forEach((n) => positionMap.set(n.id, { x: n.x, y: n.y }));
+				if (simulation.alpha() < 0.01) simulation.stop();
+			});
+	}
+
+	function selfLoopPath(x, y) {
+		return `M ${x - 3} ${y - 10} C ${x - 22} ${y - 38} ${x + 22} ${y - 38} ${x + 3} ${y - 10}`;
+	}
+
+	// ═══════════════════════════════════════════════════════════
+	// Scale / keyboard
+	// ═══════════════════════════════════════════════════════════
+	const switchLabels = ['AUTO', 'MID', 'DOWN'];
+	const SCALE_NAMES = ['Chromatic','Major','Minor','Pentatonic','Min Penta','Blues','Dorian','Mixolydian'];
+	const SCALE_INTERVALS = [
+		[0,1,2,3,4,5,6,7,8,9,10,11],
+		[0,2,4,5,7,9,11],
+		[0,2,3,5,7,8,10],
+		[0,2,4,7,9],
+		[0,3,5,7,10],
+		[0,3,5,6,7,10],
+		[0,2,3,5,7,9,10],
+		[0,2,4,5,7,9,10],
+	];
+	$: activeScaleIntervals = SCALE_INTERVALS[$scaleIndex] || SCALE_INTERVALS[0];
+	$: scaleNotes = new Set(activeScaleIntervals);
+
+	const KEYBOARD_KEYS = [];
+	for (let midi = 48; midi <= 71; midi++) {
+		const name = NOTE_NAMES[midi % 12];
+		const octave = Math.floor(midi / 12) - 1;
+		KEYBOARD_KEYS.push({ midi, name: name + octave, isBlack: name.includes('#') });
+	}
+	function handleScaleChange(e) { sendSetScale(parseInt(e.target.value)); }
+	function handleAutoIntervalChange(e) { sendSetAutoInterval(parseInt(e.target.value)); }
+	$: autoIntervalSec = (0.25 + ($autoInterval / 127) * (8 - 0.25)).toFixed(1);
+	function handleKeyClick(midiNote) { sendNoteOn(midiNote, 100); }
+
+	let scaleSelectEl;
+	$: if (scaleSelectEl) scaleSelectEl.selectedIndex = $scaleIndex;
+
+	// ═══════════════════════════════════════════════════════════
+	// Traveling dot animation
+	// ═══════════════════════════════════════════════════════════
+	let traveler1 = null;
+	let traveler2 = null;
+	let flashes = [];
+	let fadingGlows = [];
+	let _prevNode1 = -1;
+	let _prevNode2 = -1;
+	let animFrameId = null;
+
+	const GLOW_FADE_DUR = 350;  // ms for playing glow to fade out
+
+	function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+
+	function addFlash(nodeId, color) {
+		flashes = [...flashes, { nodeId, color, start: performance.now() }];
+	}
+
+	function onChainChange1(newId) {
+		if (newId === _prevNode1) return;
+		const fromPos = _prevNode1 >= 0 ? positionMap.get(_prevNode1) : null;
+		// Fade out the old glow
+		if (_prevNode1 >= 0) fadingGlows = [...fadingGlows, { nodeId: _prevNode1, color: COLORS.chain1, start: performance.now() }];
+		_prevNode1 = newId;
+		if (newId < 0) { traveler1 = null; return; }
+		const toPos = positionMap.get(newId);
+		if (!toPos) return;
+		addFlash(newId, COLORS.chain1);
+		if (fromPos) {
+			traveler1 = { sx: fromPos.x, sy: fromPos.y, ex: toPos.x, ey: toPos.y,
+				x: fromPos.x, y: fromPos.y, start: performance.now(),
+				targetId: newId, color: COLORS.chain1 };
+		}
+		ensureAnimLoop();
+	}
+
+	function onChainChange2(newId) {
+		if (newId === _prevNode2) return;
+		const fromPos = _prevNode2 >= 0 ? positionMap.get(_prevNode2) : null;
+		if (_prevNode2 >= 0) fadingGlows = [...fadingGlows, { nodeId: _prevNode2, color: COLORS.chain2, start: performance.now() }];
+		_prevNode2 = newId;
+		if (newId < 0) { traveler2 = null; return; }
+		const toPos = positionMap.get(newId);
+		if (!toPos) return;
+		addFlash(newId, COLORS.chain2);
+		if (fromPos) {
+			traveler2 = { sx: fromPos.x, sy: fromPos.y, ex: toPos.x, ey: toPos.y,
+				x: fromPos.x, y: fromPos.y, start: performance.now(),
+				targetId: newId, color: COLORS.chain2 };
+		}
+		ensureAnimLoop();
+	}
+
+	$: onChainChange1($currentNodeId);
+	$: onChainChange2($currentNode2Id);
+
+	function ensureAnimLoop() {
+		if (animFrameId) return;
+		animFrameId = requestAnimationFrame(animLoop);
+	}
+
+	function animLoop() {
+		const now = performance.now();
+		// Update travelers
+		if (traveler1) {
+			const t = Math.min(1, (now - traveler1.start) / TRAVEL_DUR);
+			const e = easeOutCubic(t);
+			traveler1.x = traveler1.sx + (traveler1.ex - traveler1.sx) * e;
+			traveler1.y = traveler1.sy + (traveler1.ey - traveler1.sy) * e;
+			if (t >= 1) traveler1 = null;
+		}
+		if (traveler2) {
+			const t = Math.min(1, (now - traveler2.start) / TRAVEL_DUR);
+			const e = easeOutCubic(t);
+			traveler2.x = traveler2.sx + (traveler2.ex - traveler2.sx) * e;
+			traveler2.y = traveler2.sy + (traveler2.ey - traveler2.sy) * e;
+			if (t >= 1) traveler2 = null;
+		}
+		// Update flashes
+		flashes = flashes.filter(f => (now - f.start) < FLASH_DUR);
+		// Update fading glows
+		fadingGlows = fadingGlows.filter(g => (now - g.start) < GLOW_FADE_DUR);
+		// Trigger Svelte re-render only when there's something animating
+		if (traveler1) traveler1 = traveler1;
+		if (traveler2) traveler2 = traveler2;
+
+		// Only keep loop alive for actual animations — playing glow is purely reactive
+		if (traveler1 || traveler2 || flashes.length > 0 || fadingGlows.length > 0) {
+			animFrameId = requestAnimationFrame(animLoop);
+		} else {
+			animFrameId = null;
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════
+	// Resize
+	// ═══════════════════════════════════════════════════════════
+	function handleResize() {
+		if (!containerEl) return;
+		WIDTH = containerEl.clientWidth;
+		HEIGHT = containerEl.clientHeight;
+		if (simulation) {
+			simulation.force('center', forceCenter(WIDTH / 2, HEIGHT / 2));
+			simulation.alpha(0.3).restart();
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════
+	// Drag handlers
+	// ═══════════════════════════════════════════════════════════
+	function getSVGPoint(e) {
+		if (!svgEl) return { x: 0, y: 0 };
+		const pt = svgEl.createSVGPoint();
+		pt.x = e.clientX; pt.y = e.clientY;
+		return pt.matrixTransform(svgEl.getScreenCTM().inverse());
+	}
+
+	function onNodeMouseDown(e, nodeId) {
+		if (e.button !== 0 || connectFromNode !== null) return;
+		e.preventDefault(); e.stopPropagation();
+		const sn = simNodes.find((n) => n.id === nodeId);
+		if (!sn) return;
+		dragNode = sn; didDrag = false; focusedNodeId = nodeId;
+		sn.fx = sn.x; sn.fy = sn.y;
+		if (simulation) simulation.alphaTarget(0.3).restart();
+		window.addEventListener('mousemove', onDragMove);
+		window.addEventListener('mouseup', onDragEnd);
+	}
+	function onDragMove(e) {
+		if (!dragNode) return;
+		didDrag = true;
+		const pt = getSVGPoint(e);
+		dragNode.fx = pt.x; dragNode.fy = pt.y;
+	}
+	function onDragEnd() {
+		if (!dragNode) return;
+		dragNode.fx = null; dragNode.fy = null; dragNode = null;
+		if (simulation) simulation.alphaTarget(0);
+		window.removeEventListener('mousemove', onDragMove);
+		window.removeEventListener('mouseup', onDragEnd);
+	}
+
+	// ═══════════════════════════════════════════════════════════
+	// Click / context menu
+	// ═══════════════════════════════════════════════════════════
+	function onNodeClick(e, node) {
+		if (didDrag) { didDrag = false; return; }
+		if (connectFromNode !== null) {
+			if (connectFromNode !== node.id) sendAddLink(connectFromNode, node.id);
+			connectFromNode = null; contextMenu = null; return;
+		}
+		e.preventDefault(); e.stopPropagation();
+		focusedNodeId = node.id;
+		contextMenu = { x: e.clientX, y: e.clientY, type: 'node',
+			data: { id: node.id, pitch: node.pitch } };
+	}
+	function onLinkClick(e, sourceId, targetId) {
+		if (connectFromNode !== null) { connectFromNode = null; return; }
+		e.preventDefault(); e.stopPropagation();
+		contextMenu = { x: e.clientX, y: e.clientY, type: 'link',
+			data: { sourceId, targetId } };
+	}
+	function dismissMenu() { contextMenu = null; if (connectFromNode !== null) connectFromNode = null; focusedNodeId = null; }
+	function handleDeleteNode(id) { sendDeleteNode(id); contextMenu = null; }
+	function handleConnectNode(id) { connectFromNode = id; contextMenu = null; }
+	function handleDeleteLink(s, t) { sendDeleteLink(s, t); contextMenu = null; }
+
+	// ═══════════════════════════════════════════════════════════
+	// Reactive derivations
+	// ═══════════════════════════════════════════════════════════
+	$: focusedOutputTargets = focusedNodeId !== null
+		? new Set($graphLinks.filter(l => l.source === focusedNodeId).map(l => l.target)) : new Set();
+	$: nodesWithInput = new Set($graphLinks.map(l => l.target));
+	$: nodeLabels = computeLabels(displayNodes, $scaleIndex);
+	$: if ($graphNodes || $graphLinks) updateSimulation($graphNodes, $graphLinks);
+
+	onMount(() => { positionMap.clear(); handleResize(); });
+	onDestroy(() => {
+		if (simulation) simulation.stop();
+		if (animFrameId) cancelAnimationFrame(animFrameId);
+		window.removeEventListener('mousemove', onDragMove);
+		window.removeEventListener('mouseup', onDragEnd);
+	});
+</script>
+
+<svelte:window on:click={dismissMenu} on:resize={handleResize} />
+
+<div class="app" bind:this={containerEl}>
+	<svg bind:this={svgEl} class="network-bg" viewBox="0 0 {WIDTH} {HEIGHT}">
+		<defs>
+			<!-- Star ambient glow -->
+			<filter id="star-glow" x="-200%" y="-200%" width="500%" height="500%">
+				<feGaussianBlur stdDeviation="0.8" result="blur" />
+				<!-- <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge> -->
+			</filter>
+			<!-- Focused star glow -->
+			<filter id="star-focus" x="-200%" y="-200%" width="500%" height="500%">
+				<feGaussianBlur stdDeviation="5" result="blur" />
+				<feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+			</filter>
+			<!-- Traveler dot glow -->
+			<filter id="glow-traveler" x="-300%" y="-300%" width="700%" height="700%">
+				<feGaussianBlur stdDeviation="8" result="blur" />
+				<feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+			</filter>
+			<!-- Flash glow -->
+			<filter id="glow-flash" x="-200%" y="-200%" width="500%" height="500%">
+				<feGaussianBlur stdDeviation="6" result="blur" />
+				<feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+			</filter>
+			<!-- Persistent playing glow (soft, quite blurred) -->
+			<filter id="glow-playing" x="-400%" y="-400%" width="900%" height="900%">
+				<feGaussianBlur stdDeviation="10" result="blur" />
+				<!-- <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge> -->
+			</filter>
+		</defs>
+
+		<!-- ═══ Persistent playing glow (faint halo behind current note) ═══ -->
+		{#each displayNodes as node}
+			{@const isP1 = node.id === $currentNodeId}
+			{@const isP2 = node.id === $currentNode2Id}
+			{#if isP1 || isP2}
+				<circle cx={node.x} cy={node.y} r="12"
+					fill={isP1 ? COLORS.chain1 : COLORS.chain2} opacity="0.8"
+					filter="url(#glow-playing)" pointer-events="none" />
+			{/if}
+		{/each}
+		<!-- Fading glows (old playing positions) -->
+		{#each fadingGlows as fg}
+			{@const node = displayNodes.find(n => n.id === fg.nodeId)}
+			{#if node}
+				{@const age = Math.min(1, (performance.now() - fg.start) / GLOW_FADE_DUR)}
+				{@const op = 0.8 * (1 - age)}
+				<circle cx={node.x} cy={node.y} r="12"
+					fill={fg.color} opacity={op}
+					filter="url(#glow-playing)" pointer-events="none" />
+			{/if}
+		{/each}
+
+		<!-- ═══ Links — thin constellation lines ═══ -->
+		{#each displayLinks as link}
+			{@const isFocused = focusedNodeId !== null && link.sourceId === focusedNodeId}
+			{@const color = isFocused ? COLORS.focus : '#c9a0dc'}
+			{@const opacity = isFocused ? 0.5 : 0.22}
+			{#if link.sourceId === link.targetId}
+				{@const node = displayNodes.find((n) => n.id === link.sourceId)}
+				{#if node}
+					<path d={selfLoopPath(node.x, node.y)} fill="none" stroke="transparent"
+						stroke-width="14" style="cursor: pointer"
+						on:click|stopPropagation={(e) => onLinkClick(e, link.sourceId, link.targetId)} />
+					<path d={selfLoopPath(node.x, node.y)} fill="none"
+						stroke={color} stroke-width="0.7" opacity={opacity}
+						pointer-events="none" />
+				{/if}
+			{:else}
+				<line x1={link.x1} y1={link.y1} x2={link.x2} y2={link.y2}
+					stroke="transparent" stroke-width="14" style="cursor: pointer"
+					on:click|stopPropagation={(e) => onLinkClick(e, link.sourceId, link.targetId)} />
+				<line x1={link.x1} y1={link.y1} x2={link.x2} y2={link.y2}
+					stroke={color} stroke-width="0.7" opacity={opacity}
+					pointer-events="none" />
+			{/if}
+		{/each}
+
+		
+
+		<!-- ═══ Stars ═══ -->
+		{#each displayNodes as node}
+			{@const isFocusSource = focusedNodeId === node.id}
+			{@const isFocusTarget = focusedOutputTargets.has(node.id)}
+			{@const isOrphan = !nodesWithInput.has(node.id) && !isFocusSource && !isFocusTarget}
+			{@const baseHex = isFocusSource ? COLORS.focus : isFocusTarget ? COLORS.focusTarget : COLORS.network}
+			{@const fill = pitchColor(node.pitch, baseHex)}
+			{@const filter = isFocusSource || isFocusTarget ? 'url(#star-focus)' : 'url(#star-glow)'}
+			{@const isConnectSource = connectFromNode === node.id}
+			<g filter={filter}
+				style="cursor: {connectFromNode !== null ? 'crosshair' : 'grab'}"
+				opacity={isOrphan ? 0.5 : 1}
+				on:mousedown|stopPropagation={(e) => onNodeMouseDown(e, node.id)}
+				on:click|stopPropagation={(e) => onNodeClick(e, node)}>
+				<!-- invisible hit area -->
+				<circle cx={node.x} cy={node.y} r={STAR_HIT_R} fill="transparent" />
+				<!-- star shape -->
+				<path d={starPath(node.x, node.y, node.pitch)}
+					fill={isConnectSource ? COLORS.focus : fill}
+					stroke="none" />
+			</g>
+			<!-- label — up and to the right -->
+			<text x={node.x + 14} y={node.y - 10} class="star-label"
+				fill={isFocusSource ? COLORS.focus : isFocusTarget ? COLORS.focusTarget : COLORS.textDim}
+				opacity={isOrphan ? 0.3 : 1}
+				pointer-events="none">{nodeLabels.get(node.id) || ''}</text>
+		{/each}
+
+		
+
+		<!-- ═══ Traveling dots ═══ -->
+		{#if traveler1}
+			<circle cx={traveler1.x} cy={traveler1.y} r="3"
+				fill={traveler1.color} filter="url(#glow-traveler)" pointer-events="none" />
+		{/if}
+		{#if traveler2}
+			<circle cx={traveler2.x} cy={traveler2.y} r="3"
+				fill={traveler2.color} filter="url(#glow-traveler)" pointer-events="none" />
+		{/if}
+
+		<!-- ═══ Flashes ═══ -->
+		{#each flashes as flash}
+			{@const node = displayNodes.find(n => n.id === flash.nodeId)}
+			{#if node}
+				{@const age = Math.min(1, (performance.now() - flash.start) / FLASH_DUR)}
+				{@const opacity = 0.9 * (1 - age)}
+				{@const radius = 4 + age * 10}
+				<circle cx={node.x} cy={node.y} r={radius}
+					fill="white" opacity={opacity}
+					filter="url(#glow-flash)" pointer-events="none" />
+			{/if}
+		{/each}
+
+		{#if displayNodes.length === 0}
+			<text x={WIDTH / 2} y={HEIGHT / 2} text-anchor="middle" fill="#333"
+				font-size="14" font-family="'Courier New', monospace">
+				No nodes — flip switch up for auto mode
+			</text>
+		{/if}
+	</svg>
+
+	<!-- ═══ Glass panels ═══ -->
+	<div class="panel panel-top">
+		<span class="title">Constelations</span>
+		<div class="conn-bar">
+			<button class="btn" class:connected={$midiConnected} on:click={connectMIDI}>
+				{$midiConnected ? '● Connected' : 'Connect MIDI'}
+			</button>
+			{#if $deviceNames.length > 0}
+				<select class="sel" value={$selectedDevice} on:change={handleDeviceChange}>
+					<option value="" disabled>Select device…</option>
+					{#each $deviceNames as name}<option value={name}>{name}</option>{/each}
+				</select>
+			{/if}
+			{#if $midiConnected}
+				<button class="btn" on:click={requestPull}>↻</button>
+			{/if}
+		</div>
+	</div>
+
+	<div class="panel panel-status">
+		<div class="stat"><span class="sl">NODES</span><span class="sv">{$nodeCount}</span></div>
+		<div class="stat"><span class="sl">CH1</span><span class="sv c1">{$currentNodeId >= 0 ? $currentNodeId : '—'}</span></div>
+		<div class="stat"><span class="sl">CH2</span><span class="sv c2">{$currentNode2Id >= 0 ? $currentNode2Id : '—'}</span></div>
+		<div class="stat"><span class="sl">PROB</span><span class="sv">{Math.round(($knobMain / 4095) * 100)}%</span></div>
+		<div class="stat"><span class="sl">SPEED</span><span class="sv">{Math.round(($knobX / 4095) * 100)}%</span></div>
+		<div class="stat"><span class="sl">RANGE</span><span class="sv">{Math.round(($knobY / 4095) * 100)}%</span></div>
+		<div class="stat"><span class="sl">SW</span><span class="sv">{switchLabels[$switchState] || '?'}</span></div>
+		<div class="stat">
+			<span class="sl">SCALE</span>
+			<select class="sel sel-sm" bind:this={scaleSelectEl} on:change={handleScaleChange}>
+				{#each SCALE_NAMES as name, i}<option value={i}>{name}</option>{/each}
+			</select>
+		</div>
+		<div class="stat">
+			<span class="sl">AUTO</span>
+			<input type="range" class="slider-sm" min="0" max="127" value={$autoInterval} on:input={handleAutoIntervalChange}>
+			<span class="sv" style="min-width: 2.5em; text-align: right">{autoIntervalSec}s</span>
+		</div>
+	</div>
+
+	{#if connectFromNode !== null}
+		<div class="panel panel-banner">
+			Click a node to connect from node {connectFromNode} →
+			<button class="btn btn-cancel" on:click|stopPropagation={() => { connectFromNode = null; }}>Cancel</button>
+		</div>
+	{/if}
+
+	<div class="panel panel-keyboard">
+		<div class="keyboard">
+			{#each KEYBOARD_KEYS.filter(k => !k.isBlack) as key}
+				<button class="key wk" style="opacity: {scaleNotes.has(key.midi % 12) ? 1 : 0.3}" on:click={() => handleKeyClick(key.midi)}>
+					<span class="kl">{key.name}</span>
+				</button>
+			{/each}
+			{#each KEYBOARD_KEYS.filter(k => k.isBlack) as key}
+				{@const noteInOctave = key.midi % 12}
+				{@const octaveOffset = Math.floor((key.midi - 48) / 12)}
+				{@const blackPositions = {1: 0.65, 3: 1.65, 6: 3.65, 8: 4.65, 10: 5.65}}
+				{@const pos = (blackPositions[noteInOctave] || 0) + octaveOffset * 7}
+				<button class="key bk" style="left: calc({pos} * (100% / 14) + (100% / 28)); opacity: {scaleNotes.has(key.midi % 12) ? 1 : 0.3}"
+					on:click={() => handleKeyClick(key.midi)}></button>
+			{/each}
+		</div>
+	</div>
+
+	{#if contextMenu}
+		<div class="ctx-menu" style="left: {contextMenu.x}px; top: {contextMenu.y}px"
+			on:click|stopPropagation>
+			{#if contextMenu.type === 'node'}
+				<div class="ctx-header">Node {contextMenu.data.id} — {rawPitchToNote(contextMenu.data.pitch)}</div>
+				<div class="ctx-item" on:click={() => handleConnectNode(contextMenu.data.id)}>Connect to…</div>
+				<div class="ctx-sep"></div>
+				<div class="ctx-item ctx-danger" on:click={() => handleDeleteNode(contextMenu.data.id)}>Delete node</div>
+			{:else if contextMenu.type === 'link'}
+				<div class="ctx-item ctx-danger"
+					on:click={() => handleDeleteLink(contextMenu.data.sourceId, contextMenu.data.targetId)}>
+					Delete link {contextMenu.data.sourceId} → {contextMenu.data.targetId}
+				</div>
+			{/if}
+		</div>
+	{/if}
+</div>
+
+<style>
+	:global(*) { box-sizing: border-box; margin: 0; padding: 0; }
+	:global(body) {
+		font-family: 'Courier New', monospace;
+		background: #08080f; color: #ccc; overflow: hidden;
+	}
+	.app { position: fixed; inset: 0; background: #08080f; }
+	.network-bg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+	/* ═══ Glass panels ═══ */
+	.panel {
+		position: absolute;
+		background: rgba(12, 12, 20, 0.75);
+		backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+		border: 1px solid rgba(155, 89, 182, 0.25);
+		border-radius: 8px; padding: 8px 14px; z-index: 10;
+	}
+	.panel-top {
+		top: 10px; left: 10px; right: 10px;
+		display: flex; justify-content: space-between; align-items: center; gap: 10px;
+	}
+	.panel-status {
+		top: 52px; left: 10px;
+		display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
+	}
+	.panel-banner {
+		top: 96px; left: 10px; right: 10px;
+		color: #ff9500; font-size: 12px;
+		display: flex; align-items: center; gap: 10px;
+		border-color: rgba(255, 149, 0, 0.3);
+	}
+	.panel-keyboard { bottom: 10px; left: 10px; right: 10px; padding: 5px; }
+
+	.title { font-size: 14px; color: #9b59b6; letter-spacing: 4px; font-weight: bold; }
+	.stat { display: flex; flex-direction: column; align-items: center; gap: 1px; }
+	.sl { font-size: 8px; color: #9b59b6; letter-spacing: 1px; text-transform: uppercase; }
+	.sv { font-size: 12px; color: #ddd; }
+	.c1 { color: #00e5ff; }
+	.c2 { color: #d4ff00; }
+
+	.conn-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+	.btn {
+		background: rgba(155, 89, 182, 0.15); color: #ccc;
+		border: 1px solid rgba(155, 89, 182, 0.3);
+		padding: 5px 14px; border-radius: 4px;
+		font-family: inherit; font-size: 11px;
+		cursor: pointer; transition: all 0.2s;
+	}
+	.btn:hover { background: rgba(155, 89, 182, 0.3); border-color: #9b59b6; }
+	.btn.connected { background: rgba(0,180,80,0.15); color: #5c5; border-color: rgba(0,180,80,0.3); }
+	.btn-cancel { color: #ff9500; border-color: rgba(255,149,0,0.3); }
+
+	.sel {
+		background: rgba(12, 12, 20, 0.8); color: #ccc;
+		border: 1px solid rgba(155, 89, 182, 0.3);
+		padding: 4px 8px; border-radius: 4px;
+		font-family: inherit; font-size: 11px; cursor: pointer;
+	}
+	.sel:focus { border-color: #9b59b6; outline: none; }
+	.sel-sm { font-size: 10px; padding: 2px 6px; }
+	.slider-sm {
+		width: 60px; height: 4px; -webkit-appearance: none; appearance: none;
+		background: rgba(155, 89, 182, 0.3); border-radius: 2px; outline: none; cursor: pointer;
+		vertical-align: middle; margin: 0 4px;
+	}
+	.slider-sm::-webkit-slider-thumb {
+		-webkit-appearance: none; width: 10px; height: 10px;
+		border-radius: 50%; background: #9b59b6; cursor: pointer;
+	}
+
+	/* ═══ Star labels ═══ */
+	.star-label {
+		font-family: 'Courier New', monospace;
+		font-size: 9px; letter-spacing: 0.5px;
+		user-select: none;
+	}
+
+	/* ═══ Context menu ═══ */
+	.ctx-menu {
+		position: fixed;
+		background: rgba(12, 12, 20, 0.9);
+		backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+		border: 1px solid rgba(155, 89, 182, 0.4);
+		border-radius: 6px; padding: 4px 0;
+		z-index: 1000; min-width: 160px;
+		box-shadow: 0 4px 24px rgba(0,0,0,0.7);
+	}
+	.ctx-header {
+		padding: 6px 14px; font-size: 10px;
+		color: #9b59b6; border-bottom: 1px solid rgba(155, 89, 182, 0.2);
+		font-family: 'Courier New', monospace;
+		letter-spacing: 0.5px;
+	}
+	.ctx-item {
+		padding: 7px 14px; font-size: 11px;
+		font-family: 'Courier New', monospace;
+		color: #ccc; cursor: pointer;
+	}
+	.ctx-item:hover { background: rgba(155,89,182,0.2); color: #fff; }
+	.ctx-danger { color: #ff4444; }
+	.ctx-danger:hover { background: rgba(255,0,0,0.1); color: #ff2222; }
+	.ctx-sep { border-top: 1px solid rgba(155,89,182,0.2); margin: 2px 0; }
+
+	/* ═══ Keyboard ═══ */
+	.keyboard { position: relative; display: flex; height: 54px; overflow: hidden; border-radius: 4px; }
+	.key {
+		border: none; cursor: pointer;
+		font-family: 'Courier New', monospace;
+		transition: background 0.1s, opacity 0.2s;
+	}
+	.wk {
+		flex: 1; background: rgba(220,220,220,0.9);
+		border-right: 1px solid rgba(100,100,100,0.5);
+		display: flex; align-items: flex-end; justify-content: center;
+		padding-bottom: 3px; z-index: 1;
+	}
+	.wk:hover { background: #9b59b6; }
+	.wk:active { background: #00e5ff; }
+	.kl { font-size: 6px; color: #444; pointer-events: none; }
+	.bk {
+		position: absolute; top: 0; width: calc(100% / 21);
+		height: 32px; background: #1a1a2e;
+		border-radius: 0 0 3px 3px; z-index: 2;
+	}
+	.bk:hover { background: #9b59b6; }
+	.bk:active { background: #00e5ff; }
+</style>

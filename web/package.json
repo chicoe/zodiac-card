@@ -1,0 +1,22 @@
+{
+  "name": "zodiac-card-ui",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.0",
+    "@sveltejs/kit": "^2.0.0",
+    "@sveltejs/vite-plugin-svelte": "^4.0.0",
+    "svelte": "^5.0.0",
+    "vite": "^5.0.0"
+  },
+  "dependencies": {
+    "@fontsource/monaspace-krypton": "^5.2.5",
+    "d3-force": "^3.0.0"
+  },
+  "type": "module"
+}

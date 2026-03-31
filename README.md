@@ -1,6 +1,11 @@
 # Zodiac Card
 
+
 A **Markov chain sequencer** for the [Music Thing Modular Workshop System Computer Module](https://www.musicthing.co.uk/workshopsystem/). Nodes in a probabilistic graph are traversed at each clock step, generating scale-quantized pitched output based on weighted transitions. Two independent chains can traverse the same graph simultaneously.
+
+**Disclaimer:** 
+This is a prototype built late at night, with heavy LLM usage and barely any testing, its use as an example or in production is highly discouraged. That being said, it is open source so do whatever you want.
+
 
 ## How It Works
 

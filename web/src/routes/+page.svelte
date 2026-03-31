@@ -1,6 +1,7 @@
 <script>
 	import '@fontsource/monaspace-krypton';
 	import { onMount, onDestroy } from 'svelte';
+	import { base } from '$app/paths';
 	import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide } from 'd3-force';
 	import { connectMIDI, selectDevice, requestPull, sendDeleteNode, sendDeleteLink, sendAddLink, sendNoteOn, sendSetScale, sendSetAutoInterval } from '$lib/midi.js';
 	import {
@@ -568,7 +569,7 @@
 				<br/>
 				<br/>To install, download the .UF2 file below, save it to the card and connect via USB MIDI (Chrome only).
 			</div>
-			<a class="btn btn-dl" href="/zodiac-card-v0.2.uf2" download>⬇ DOWNLOAD .UF2</a>
+			<a class="btn btn-dl" href="{base}/zodiac-card-v0.2.uf2" download>⬇ DOWNLOAD .UF2</a>
 		</details>
 
 		<details class="side-section" on:click={toggleDetails}>

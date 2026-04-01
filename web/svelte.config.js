@@ -11,7 +11,7 @@ const config = {
 			fallback: 'index.html'
 		}),
 		paths: {
-			base: dev ? '' : process.env.BASE_PATH || '/zodiac-card'
+			base: dev ? '' : process.env.BASE_PATH || ''
 		}
 	}
 };

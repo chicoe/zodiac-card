@@ -537,8 +537,8 @@
 
 	<!-- ═══ Header bar ═══ -->
 	<div class="header">
-		<span class="title">ZODIAC CARD</span>
-		<span class="subtitle"> | BETA v0.2</span>
+		<span class="title">ZODIAC SEQUENCER CARD</span>
+		<span class="subtitle"> | BETA v0.2.1</span>
 		<div class="hdr-rule"></div>
 		<div class="conn-bar">
 			<button class="btn" class:connected={$midiConnected} on:click={connectMIDI}>

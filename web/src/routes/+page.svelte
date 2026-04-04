@@ -166,8 +166,11 @@
 		KEYBOARD_KEYS.push({ midi, name: name + octave, isBlack, gapAfter });
 	}
 	function handleScaleChange(e) { sendSetScale(parseInt(e.target.value)); }
-	function handleAutoIntervalChange(e) { sendSetAutoInterval(parseInt(e.target.value)); }
-	$: autoIntervalSec = (0.25 + ($autoInterval / 127) * (8 - 0.25)).toFixed(1);
+	let autoIntervalLocal = null;
+	function handleAutoIntervalInput(e) { autoIntervalLocal = parseInt(e.target.value); }
+	function handleAutoIntervalChange(e) { autoIntervalLocal = null; sendSetAutoInterval(parseInt(e.target.value)); }
+	$: autoIntervalDisplay = autoIntervalLocal ?? $autoInterval;
+	$: autoIntervalSec = (0.25 + (autoIntervalDisplay / 127) * (8 - 0.25)).toFixed(1);
 	$: speedBpm = Math.round(1440000 / (2400 + ((4095 - $knobX) * 93600) / 4095));
 	$: rangeOct = ((1 + ($knobY * 35) / 4095) * 2 / 12).toFixed(1);
 	function handleKeyClick(midiNote) { sendNoteOn(midiNote, 100); }
@@ -669,7 +672,7 @@
 			<div class="bottom-ctrl">
 				<span class="ctrl-label">AUTO INTERVAL</span>
 				<div class="slider-row">
-					<input type="range" class="slider" min="0" max="127" value={$autoInterval} on:input={handleAutoIntervalChange}>
+					<input type="range" class="slider" min="0" max="127" value={$autoInterval} on:input={handleAutoIntervalInput} on:change={handleAutoIntervalChange}>
 					<span class="mv">{autoIntervalSec}s</span>
 				</div>
 			</div>

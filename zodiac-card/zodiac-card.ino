@@ -32,6 +32,8 @@
 #include "WebInterface.h"
 #include <math.h>
 #include "hardware/structs/rosc.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
 
 // ═══════════════════════════════════════════════════════════════════
 // Constants
@@ -45,6 +47,11 @@ static constexpr uint32_t DEFAULT_STEP_INTERVAL= 24000;   // 500ms (~2 Hz)
 static constexpr uint32_t GATE_LENGTH_PCT      = 50;      // gate = 50% of step
 static constexpr uint32_t SINE_TABLE_SIZE      = 256;
 static constexpr int      NUM_SCALES           = 8;
+
+// Flash persistence — last 4KB sector
+// Layout: [0] magic | [1] scaleIndex | [2-5] autoInterval (uint32_t)
+static constexpr uint8_t  FLASH_MAGIC         = 0xAC;
+static constexpr uint32_t FLASH_TARGET_OFFSET = PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE;
 
 // ═══════════════════════════════════════════════════════════════════
 // Scale definitions — intervals from root (in semitones)
@@ -209,6 +216,45 @@ public:
         uint16_t weight;    // for add link
     };
     volatile PendingEdit pendingEdit = {0, 0, 0, 0};
+
+    // Set by Core 0 (switch flick), consumed by Core 1
+    volatile bool pendingFlashSave = false;
+    // Core 1 sets flashSaveActive to pause Core 0 inside ProcessSample() (RAM)
+    volatile bool flashSaveActive  = false;
+    volatile bool core0InPause     = false;
+
+    uint64_t flashSaveDeadline = 0;
+    bool     flashSaveDirty    = false;
+
+    // Debounced save — resets the 1-second timer on each call
+    void scheduleSave() {
+        flashSaveDeadline = time_us_64() + 1000000ULL;
+        flashSaveDirty    = true;
+    }
+
+    // Writes scaleIndex and autoInterval to the last flash sector.
+    // Must be called from Core 1. Pauses Core 0 cooperatively via flashSaveActive:
+    // Core 0 spins inside ProcessSample() which is __not_in_flash_func (RAM),
+    // making it safe to disable XIP for erase/write.
+    void __not_in_flash_func(saveToFlash)() {
+        static uint8_t buf[FLASH_SECTOR_SIZE];
+        for (int i = 0; i < FLASH_SECTOR_SIZE; i++) buf[i] = 0xFF;
+        buf[0] = FLASH_MAGIC;
+        buf[1] = (uint8_t)scaleIndex;
+        uint32_t ai = autoInterval;
+        buf[2] = (uint8_t)(ai);
+        buf[3] = (uint8_t)(ai >> 8);
+        buf[4] = (uint8_t)(ai >> 16);
+        buf[5] = (uint8_t)(ai >> 24);
+
+        flashSaveActive = true;
+        while (!core0InPause) tight_loop_contents();
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE);
+        flash_range_program(FLASH_TARGET_OFFSET, buf, FLASH_SECTOR_SIZE);
+        restore_interrupts(ints);
+        flashSaveActive = false;
+    }
 
     // ───────────────────────────────────────────────────────────
     // Pitch → sine phase increment (called once per node change)
@@ -772,7 +818,10 @@ public:
 
         if (cmd == MSG_SET_SCALE && size >= 2) {
             uint8_t idx = data[1];
-            if (idx < NUM_SCALES) scaleIndex = idx;
+            if (idx < NUM_SCALES) {
+                scaleIndex = idx;
+                scheduleSave();
+            }
             return;
         }
 
@@ -791,6 +840,7 @@ public:
             if (val > 127) val = 127;
             // Linear map: 0 → 0.25s (6000 samples), 127 → 8s (192000 samples)
             autoInterval = 6000 + ((uint32_t)val * (192000 - 6000)) / 127;
+            scheduleSave();
             return;
         }
     }
@@ -800,6 +850,15 @@ public:
     // Sends CC status and SysEx node data to the browser.
     // ───────────────────────────────────────────────────────────
     void MIDICore() override {
+        if (pendingFlashSave) {
+            pendingFlashSave = false;
+            scheduleSave();
+        }
+        if (flashSaveDirty && time_us_64() >= flashSaveDeadline) {
+            flashSaveDirty = false;
+            saveToFlash();
+        }
+
         if (!time_reached(nextMidiServiceTime)) return;
         nextMidiServiceTime = make_timeout_time_us(1000);
 
@@ -1016,6 +1075,7 @@ public:
         if (currentSwitchDown && !prevSwitchDown) {
             // Flick down: cycle to next scale
             scaleIndex = (scaleIndex + 1) % NUM_SCALES;
+            pendingFlashSave = true;
         }
         prevSwitchDown = currentSwitchDown;
 
@@ -1205,6 +1265,12 @@ public:
         } else {
             for (int i = 0; i < 6; i++) LedOff(i);
         }
+
+        if (flashSaveActive) {
+            core0InPause = true;
+            while (flashSaveActive) tight_loop_contents();
+            core0InPause = false;
+        }
     }
 };
 
@@ -1216,6 +1282,17 @@ ZodiacCard card;
 void setup() {
     initSineTable();
     seedRNG();
+
+    // Load persisted settings from flash (XIP memory-mapped read, no library needed)
+    const uint8_t* flash = (const uint8_t*)(XIP_BASE + FLASH_TARGET_OFFSET);
+    if (flash[0] == FLASH_MAGIC) {
+        uint8_t si = flash[1];
+        if (si < NUM_SCALES) card.scaleIndex = si;
+        uint32_t ai;
+        memcpy(&ai, &flash[2], sizeof(ai));
+        if (ai >= 6000 && ai <= 192000) card.autoInterval = ai;
+    }
+
     card.nextMidiServiceTime = get_absolute_time();
     card.EnableNormalisationProbe();
     card.beginMIDI("Zodiac Card");

@@ -47,9 +47,10 @@ let midiAccess = null;
 const internalNodes = new Map();
 let totalNodeCount = 0;
 
-/** Request full graph dump from firmware */
+/** Clear local state and request a full graph dump from firmware */
 export function requestPull() {
 	if (!midiOutput) return;
+	clearGraphState();
 	midiOutput.send([0xf0, MANUFACTURER_ID, MSG_PULL_REQUEST, 0xf7]);
 }
 
@@ -98,6 +99,17 @@ export function sendSetAutoInterval(val) {
 	autoInterval.set(val);
 	if (!midiOutput) return;
 	midiOutput.send([0xf0, MANUFACTURER_ID, MSG_SET_AUTO_INT, val & 0x7f, 0xf7]);
+}
+
+/** Clear all graph state — called when connection is (re)established */
+function clearGraphState() {
+	internalNodes.clear();
+	totalNodeCount = 0;
+	graphNodes.set([]);
+	graphLinks.set([]);
+	currentNodeId.set(-1);
+	currentNode2Id.set(-1);
+	nodeCount.set(0);
 }
 
 /** Evict lowest-ID (oldest) entries from internalNodes until size <= target */
@@ -153,14 +165,9 @@ function handleMIDI(event) {
 			case CC_NODE_COUNT:
 				nodeCount.set(val);
 				totalNodeCount = val;
-				// If we have more entries than firmware reports, evict oldest
 				if (internalNodes.size > val) {
 					evictOldest(val);
-					if (val === 0) rebuildGraph();
-					else {
-						rebuildGraph();
-						requestPull();
-					}
+					rebuildGraph();
 				}
 				break;
 			case CC_KNOB_MAIN:
@@ -247,25 +254,29 @@ function refreshDeviceList(access) {
 function autoConnect(access) {
 	refreshDeviceList(access);
 
-	// If already connected, skip
-	if (midiOutput && midiInput) return;
+	// Skip if already connected to open ports (e.g. a different device's statechange)
+	if (midiOutput?.state === 'connected' && midiInput?.state === 'connected') return;
 
-	// Try to find "Chains" device first
+	if (midiInput) midiInput.onmidimessage = null;
+	midiOutput = null;
+	midiInput = null;
+
+	// Try to find "Zodiac" device first
 	for (const output of access.outputs.values()) {
-		if (output.name && output.name.includes('Chains')) {
+		if (output.name && output.name.includes('Zodiac')) {
 			midiOutput = output;
 			break;
 		}
 	}
 	for (const input of access.inputs.values()) {
-		if (input.name && input.name.includes('Chains')) {
+		if (input.name && input.name.includes('Zodiac')) {
 			midiInput = input;
 			input.onmidimessage = handleMIDI;
 			break;
 		}
 	}
 
-	// If no "Chains" device found, auto-connect if exactly one device
+	// If no "Zodiac" device found, auto-connect if exactly one device
 	if (!midiOutput || !midiInput) {
 		const outputs = [...access.outputs.values()];
 		const inputs = [...access.inputs.values()];
@@ -290,8 +301,20 @@ export async function connectMIDI() {
 	try {
 		midiAccess = await navigator.requestMIDIAccess({ sysex: true });
 		autoConnect(midiAccess);
-		midiAccess.addEventListener('statechange', () => {
-			if (midiAccess) autoConnect(midiAccess);
+		midiAccess.addEventListener('statechange', (event) => {
+			if (!midiAccess) return;
+			// If the state change is for our connected device, force-clear so
+			// autoConnect will re-establish and call clearGraphState + requestPull.
+			// This handles fast resets where the browser only sees one statechange
+			// (the reconnect) rather than a disconnect/reconnect pair.
+			const port = event.port;
+			if (port === midiOutput || port === midiInput) {
+				if (midiInput) midiInput.onmidimessage = null;
+				midiOutput = null;
+				midiInput = null;
+				midiConnected.set(false);
+			}
+			autoConnect(midiAccess);
 		});
 	} catch (e) {
 		console.error('MIDI access denied:', e);

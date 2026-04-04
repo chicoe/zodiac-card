@@ -541,7 +541,7 @@
 	<!-- ═══ Header bar ═══ -->
 	<div class="header">
 		<span class="title">ZODIAC SEQUENCER CARD</span>
-		<span class="subtitle"> | BETA v0.2.1</span>
+		<span class="subtitle"> | BETA v0.2.2</span>
 		<div class="hdr-rule"></div>
 		<div class="conn-bar">
 			<button class="btn" class:connected={$midiConnected} on:click={connectMIDI}>
@@ -821,6 +821,37 @@
 		background-color: #00000090;
 		padding: 10px 10px;
 	}
+
+	@media (max-width: 1024px) {
+		.sidebar {
+			flex-wrap: nowrap;
+			overflow-y: auto;
+			overflow-x: hidden;
+			width: 220px;
+			padding-bottom: 12px;
+		}
+		.side-section {
+			width: 196px;
+		}
+	}
+
+	.sidebar::-webkit-scrollbar {
+		width: 4px;
+	}
+	.sidebar::-webkit-scrollbar-track {
+		background: #050500;
+	}
+	.sidebar::-webkit-scrollbar-thumb {
+		background: #4a3d00;
+		border-radius: 2px;
+	}
+	.sidebar::-webkit-scrollbar-thumb:hover {
+		background: #aa8800;
+	}
+	.sidebar {
+		scrollbar-width: thin;
+		scrollbar-color: #4a3d00 #050500;
+	}
 	.side-section, details.side-section {
 		margin-bottom: 10px;
 		/* flex-shrink: 0; */
@@ -946,7 +977,7 @@
 	}
 	.note-btn.is-black {
 		min-width: 38px;
-		padding: 4px 4px;.
+		padding: 4px 4px;
 		font-size: 11px;
 	}
 	.note-btn.is-black.gap-after {
@@ -967,6 +998,13 @@
 	.disclaimer strong { color: #6a5500; font-weight: normal; }
 	.disc-link { color: #6a5500; text-decoration: underline; }
 	.disc-link:hover { color: #aa8800; }
+
+	@media (max-width: 1024px) {
+		.disclaimer {
+			position: static;
+			padding: 8px 0;
+		}
+	}
 
 	/* ═══ Note buttons ═══ */
 	.note-btn {

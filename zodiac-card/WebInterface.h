@@ -52,6 +52,20 @@ public:
         MidiUSB.flush();
     }
 
+    void SendNoteOn(uint8_t channel, uint8_t note, uint8_t vel)
+    {
+        uint8_t msg[] = {(uint8_t)(0x90 | (channel & 0x0F)), (uint8_t)(note & 0x7F), (uint8_t)(vel & 0x7F)};
+        MidiUSB.write(msg, 3);
+        MidiUSB.flush();
+    }
+
+    void SendNoteOff(uint8_t channel, uint8_t note)
+    {
+        uint8_t msg[] = {(uint8_t)(0x80 | (channel & 0x0F)), (uint8_t)(note & 0x7F), 0};
+        MidiUSB.write(msg, 3);
+        MidiUSB.flush();
+    }
+
     void USBCore()
     {
         while (1)
@@ -94,11 +108,13 @@ public:
             if (sysexLen < sysexBufSize) sysexBuf[sysexLen++] = pkt.byte3;
             DispatchSysEx();
             break;
-        case 0x09: // Note On
+        case 0x09: // Note On — only respond to channel 1 (0x90)
         {
-            uint8_t note = pkt.byte2 & 0x7F;
-            uint8_t vel  = pkt.byte3 & 0x7F;
-            if (vel > 0) ProcessIncomingNoteOn(note, vel);
+            if ((pkt.byte1 & 0x0F) == 0) { // channel 1 = status 0x90
+                uint8_t note = pkt.byte2 & 0x7F;
+                uint8_t vel  = pkt.byte3 & 0x7F;
+                if (vel > 0) ProcessIncomingNoteOn(note, vel);
+            }
             break;
         }
         }

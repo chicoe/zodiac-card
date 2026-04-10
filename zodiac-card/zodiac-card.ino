@@ -969,6 +969,7 @@ public:
         static int16_t lastKM = -1, lastKX = -1, lastKY = -1, lastSW = -1;
         static int16_t lastCN2 = -2, lastScale = -1, lastAutoInt = -1;
         static int16_t lastWaveform = -1, lastBassMode = -1, lastWaveform2 = -1, lastBassMode2 = -1;
+        static int8_t lastMidiNote1 = -1, lastMidiNote2 = -1;
         uint64_t now = time_us_64();
 
         // CC: Current node (send node ID, not array index)
@@ -976,6 +977,18 @@ public:
             ? (int16_t)nodes[currentNode].id : -1;
         if (curCN != lastCN) {
             SendCC(CC_CURRENT_NODE, curCN >= 0 ? (uint8_t)curCN : 127);
+            // MIDI Note output on channel 2 (index 1)
+            if (lastMidiNote1 >= 0) SendNoteOff(1, (uint8_t)lastMidiNote1);
+            if (curCN >= 0) {
+                int32_t pitch = nodes[currentNode].pitch;
+                int32_t mn = 36 + (pitch * 60) / 4096;
+                if (mn > 96) mn = 96;
+                mn = applyBassMode(mn, bassMode1);
+                SendNoteOn(1, (uint8_t)mn, 100);
+                lastMidiNote1 = (int8_t)mn;
+            } else {
+                lastMidiNote1 = -1;
+            }
             lastCN = curCN;
         }
 
@@ -984,6 +997,18 @@ public:
             ? (int16_t)nodes[currentNode2].id : -1;
         if (curCN2 != lastCN2) {
             SendCC(CC_CURRENT_NODE2, curCN2 >= 0 ? (uint8_t)curCN2 : 127);
+            // MIDI Note output on channel 3 (index 2)
+            if (lastMidiNote2 >= 0) SendNoteOff(2, (uint8_t)lastMidiNote2);
+            if (curCN2 >= 0) {
+                int32_t pitch = nodes[currentNode2].pitch;
+                int32_t mn = 36 + (pitch * 60) / 4096;
+                if (mn > 96) mn = 96;
+                mn = applyBassMode(mn, bassMode2);
+                SendNoteOn(2, (uint8_t)mn, 100);
+                lastMidiNote2 = (int8_t)mn;
+            } else {
+                lastMidiNote2 = -1;
+            }
             lastCN2 = curCN2;
         }
 

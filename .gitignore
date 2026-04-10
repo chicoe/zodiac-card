@@ -4,3 +4,7 @@ web/build
 web/.claude/settings.local.json
 .claude
 
+web/src/routes/+page.svelte
+zodiac-card/build/rp2040.rp2040.rpipico/zodiac-card.ino.bin
+zodiac-card/build/rp2040.rp2040.rpipico/zodiac-card.ino.map
+zodiac-card/build/rp2040.rp2040.rpipico/zodiac-card.ino.elf

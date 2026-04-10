@@ -54,6 +54,7 @@ let midiInput = null;
 /** @type {MIDIAccess | null} */
 let midiAccess = null;
 
+
 // Internal node map for incremental sync (keyed by node ID)
 /** @type {Map<number, {pitch: number, links: Array<{target: number, weight: number}>}>} */
 const internalNodes = new Map();
@@ -303,6 +304,9 @@ function refreshDeviceList(access) {
 	deviceNames.set(names);
 }
 
+/** Names to auto-detect as the sequencer device */
+const AUTO_DETECT_NAMES = ['Zodiac', 'pico'];
+
 function autoConnect(access) {
 	refreshDeviceList(access);
 
@@ -313,26 +317,32 @@ function autoConnect(access) {
 	midiOutput = null;
 	midiInput = null;
 
-	// Try to find "Zodiac" device first
-	for (const output of access.outputs.values()) {
-		if (output.name && output.name.includes('Zodiac')) {
-			midiOutput = output;
-			break;
+	// Try to find a known device by name
+	for (const keyword of AUTO_DETECT_NAMES) {
+		if (midiOutput) break;
+		for (const output of access.outputs.values()) {
+			if (output.name && output.name.toLowerCase().includes(keyword.toLowerCase())) {
+				midiOutput = output;
+				break;
+			}
 		}
 	}
-	for (const input of access.inputs.values()) {
-		if (input.name && input.name.includes('Zodiac')) {
-			midiInput = input;
-			input.onmidimessage = handleMIDI;
-			break;
+	for (const keyword of AUTO_DETECT_NAMES) {
+		if (midiInput) break;
+		for (const input of access.inputs.values()) {
+			if (input.name && input.name.toLowerCase().includes(keyword.toLowerCase())) {
+				midiInput = input;
+				input.onmidimessage = handleMIDI;
+				break;
+			}
 		}
 	}
 
-	// If no "Zodiac" device found, auto-connect if exactly one device
+	// If no known device found by name, try matching output+input by index
 	if (!midiOutput || !midiInput) {
 		const outputs = [...access.outputs.values()];
 		const inputs = [...access.inputs.values()];
-		if (outputs.length === 1 && inputs.length === 1) {
+		if (outputs.length === 1 && inputs.length >= 1) {
 			midiOutput = outputs[0];
 			midiInput = inputs[0];
 			midiInput.onmidimessage = handleMIDI;
@@ -342,9 +352,30 @@ function autoConnect(access) {
 	if (midiOutput && midiInput) {
 		midiConnected.set(true);
 		selectedDevice.set(midiOutput.name || '');
+		clearGraphState();
 		requestPull();
 	} else {
 		midiConnected.set(false);
+	}
+}
+
+/** Forward Note On/Off from external MIDI controllers to the sequencer */
+function handleExternalMIDI(event) {
+	const data = event.data;
+	if (!data || data.length < 3 || !midiOutput) return;
+	const status = data[0] & 0xf0;
+	// Forward Note On and Note Off (channel 1 only) to the sequencer
+	if ((status === 0x90 || status === 0x80) && (data[0] & 0x0f) === 0) {
+		midiOutput.send([data[0], data[1], data[2]]);
+	}
+}
+
+/** Listen to all MIDI inputs except the sequencer and forward notes */
+function setupExternalInputForwarding(access) {
+	for (const input of access.inputs.values()) {
+		if (input !== midiInput) {
+			input.onmidimessage = handleExternalMIDI;
+		}
 	}
 }
 
@@ -353,6 +384,7 @@ export async function connectMIDI() {
 	try {
 		midiAccess = await navigator.requestMIDIAccess({ sysex: true });
 		autoConnect(midiAccess);
+		setupExternalInputForwarding(midiAccess);
 		midiAccess.addEventListener('statechange', (event) => {
 			if (!midiAccess) return;
 			// If the state change is for our connected device, force-clear so
@@ -367,6 +399,7 @@ export async function connectMIDI() {
 				midiConnected.set(false);
 			}
 			autoConnect(midiAccess);
+			setupExternalInputForwarding(midiAccess);
 		});
 	} catch (e) {
 		console.error('MIDI access denied:', e);
@@ -385,22 +418,45 @@ export function selectDevice(name) {
 	midiOutput = null;
 	midiInput = null;
 
+	// Find output by name
 	for (const output of midiAccess.outputs.values()) {
 		if (output.name === name) {
 			midiOutput = output;
 			break;
 		}
 	}
-	for (const input of midiAccess.inputs.values()) {
-		if (input.name === name) {
-			midiInput = input;
-			input.onmidimessage = handleMIDI;
-			break;
+
+	if (midiOutput) {
+		// First try exact name match for input
+		for (const input of midiAccess.inputs.values()) {
+			if (input.name === name) {
+				midiInput = input;
+				break;
+			}
+		}
+		// If no exact match, find input by matching manufacturer + port index
+		// (MIDI devices often have different input/output names)
+		if (!midiInput) {
+			const outputs = [...midiAccess.outputs.values()];
+			const inputs = [...midiAccess.inputs.values()];
+			const outIdx = outputs.indexOf(midiOutput);
+			if (outIdx >= 0 && outIdx < inputs.length) {
+				midiInput = inputs[outIdx];
+			} else if (inputs.length === 1) {
+				// Only one input available — use it
+				midiInput = inputs[0];
+			}
 		}
 	}
+
+	if (midiInput) {
+		midiInput.onmidimessage = handleMIDI;
+	}
+
 	if (midiOutput && midiInput) {
 		midiConnected.set(true);
 		selectedDevice.set(name);
+		clearGraphState();
 		requestPull();
 	} else {
 		midiConnected.set(false);

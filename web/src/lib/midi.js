@@ -12,7 +12,11 @@ import {
 	deviceNames,
 	selectedDevice,
 	scaleIndex,
-	autoInterval
+	autoInterval,
+	waveformIndex1,
+	bassMode1,
+	waveformIndex2,
+	bassMode2
 } from './stores.js';
 
 // ── Protocol constants (must match firmware) ──
@@ -25,6 +29,10 @@ const CC_SWITCH = 25;
 const CC_CURRENT_NODE2 = 26;
 const CC_SCALE = 27;
 const CC_AUTO_INTERVAL = 28;
+const CC_WAVEFORM = 29;
+const CC_BASS_MODE = 30;
+const CC_WAVEFORM2 = 31;
+const CC_BASS_MODE2 = 33;
 const MSG_NODE = 0x02;
 const MSG_DELETE_NODE = 0x10;
 const MSG_DELETE_LINK = 0x11;
@@ -33,6 +41,10 @@ const MSG_PULL_REQUEST = 0x13;
 const MSG_SET_SCALE = 0x14;
 const MSG_ADD_NODE = 0x15;
 const MSG_SET_AUTO_INT = 0x16;
+const MSG_SET_WAVEFORM = 0x17;
+const MSG_SET_BASS_MODE = 0x18;
+const MSG_SET_WAVEFORM2 = 0x19;
+const MSG_SET_BASS_MODE2 = 0x1a;
 const MANUFACTURER_ID = 0x7d;
 
 /** @type {MIDIOutput | null} */
@@ -99,6 +111,34 @@ export function sendSetAutoInterval(val) {
 	autoInterval.set(val);
 	if (!midiOutput) return;
 	midiOutput.send([0xf0, MANUFACTURER_ID, MSG_SET_AUTO_INT, val & 0x7f, 0xf7]);
+}
+
+/** Send set waveform command for chain 1 (0–7) */
+export function sendSetWaveform1(idx) {
+	waveformIndex1.set(idx);
+	if (!midiOutput) return;
+	midiOutput.send([0xf0, MANUFACTURER_ID, MSG_SET_WAVEFORM, idx & 0x7f, 0xf7]);
+}
+
+/** Send set bass mode command for chain 1 */
+export function sendSetBassMode1(enabled) {
+	bassMode1.set(enabled);
+	if (!midiOutput) return;
+	midiOutput.send([0xf0, MANUFACTURER_ID, MSG_SET_BASS_MODE, enabled ? 1 : 0, 0xf7]);
+}
+
+/** Send set waveform command for chain 2 (0–7) */
+export function sendSetWaveform2(idx) {
+	waveformIndex2.set(idx);
+	if (!midiOutput) return;
+	midiOutput.send([0xf0, MANUFACTURER_ID, MSG_SET_WAVEFORM2, idx & 0x7f, 0xf7]);
+}
+
+/** Send set bass mode command for chain 2 */
+export function sendSetBassMode2(enabled) {
+	bassMode2.set(enabled);
+	if (!midiOutput) return;
+	midiOutput.send([0xf0, MANUFACTURER_ID, MSG_SET_BASS_MODE2, enabled ? 1 : 0, 0xf7]);
 }
 
 /** Clear all graph state — called when connection is (re)established */
@@ -190,6 +230,18 @@ function handleMIDI(event) {
 				break;
 			case CC_AUTO_INTERVAL:
 				autoInterval.set(val);
+				break;
+			case CC_WAVEFORM:
+				waveformIndex1.set(val);
+				break;
+			case CC_BASS_MODE:
+				bassMode1.set(val !== 0);
+				break;
+			case CC_WAVEFORM2:
+				waveformIndex2.set(val);
+				break;
+			case CC_BASS_MODE2:
+				bassMode2.set(val !== 0);
 				break;
 		}
 	} else if (data[0] === 0xf0) {

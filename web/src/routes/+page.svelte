@@ -3,11 +3,12 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { base } from '$app/paths';
 	import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide } from 'd3-force';
-	import { connectMIDI, selectDevice, requestPull, sendDeleteNode, sendDeleteLink, sendAddLink, sendNoteOn, sendSetScale, sendSetAutoInterval } from '$lib/midi.js';
+	import { connectMIDI, selectDevice, requestPull, sendDeleteNode, sendDeleteLink, sendAddLink, sendNoteOn, sendSetScale, sendSetAutoInterval, sendSetWaveform1, sendSetBassMode1, sendSetWaveform2, sendSetBassMode2 } from '$lib/midi.js';
 	import {
 		graphNodes, graphLinks, currentNodeId, currentNode2Id, nodeCount,
 		knobMain, knobX, knobY, switchState,
-		midiConnected, deviceNames, selectedDevice, scaleIndex, autoInterval
+		midiConnected, deviceNames, selectedDevice, scaleIndex, autoInterval,
+		waveformIndex1, bassMode1, waveformIndex2, bassMode2
 	} from '$lib/stores.js';
 
 	// ═══════════════════════════════════════════════════════════
@@ -143,6 +144,7 @@
 	// ═══════════════════════════════════════════════════════════
 	const switchLabels = ['AUTO', 'MID', 'DOWN'];
 	const SCALE_NAMES = ['Chromatic','Major','Minor','Pentatonic','Min Penta','Blues','Dorian','Mixolydian'];
+	const WAVEFORM_NAMES = ['Sine','Triangle','Square','Pulse','Sawtooth','Supersaw'];
 	const SCALE_INTERVALS = [
 		[0,1,2,3,4,5,6,7,8,9,10,11],
 		[0,2,4,5,7,9,11],
@@ -171,12 +173,19 @@
 	function handleAutoIntervalChange(e) { autoIntervalLocal = null; sendSetAutoInterval(parseInt(e.target.value)); }
 	$: autoIntervalDisplay = autoIntervalLocal ?? $autoInterval;
 	$: autoIntervalSec = (0.25 + (autoIntervalDisplay / 127) * (8 - 0.25)).toFixed(1);
+	function handleWaveform1Change(e) { sendSetWaveform1(parseInt(e.target.value)); }
+	function handleBassMode1Toggle() { sendSetBassMode1(!$bassMode1); }
+	function handleWaveform2Change(e) { sendSetWaveform2(parseInt(e.target.value)); }
+	function handleBassMode2Toggle() { sendSetBassMode2(!$bassMode2); }
 	$: speedBpm = Math.round(1440000 / (2400 + ((4095 - $knobX) * 93600) / 4095));
 	$: rangeOct = ((1 + ($knobY * 35) / 4095) * 2 / 12).toFixed(1);
 	function handleKeyClick(midiNote) { sendNoteOn(midiNote, 100); }
 
 	let scaleSelectEl;
 	$: if (scaleSelectEl) scaleSelectEl.selectedIndex = $scaleIndex;
+	let waveformSelect1El, waveformSelect2El;
+	$: if (waveformSelect1El) waveformSelect1El.selectedIndex = $waveformIndex1;
+	$: if (waveformSelect2El) waveformSelect2El.selectedIndex = $waveformIndex2;
 
 	// ═══════════════════════════════════════════════════════════
 	// Ring animation system
@@ -662,7 +671,7 @@
 
 	<!-- ═══ Bottom controls & keyboard ═══ -->
 	<div class="bottom-bar" style="left: {sidebarW}px;">
-		<div class="bottom-top-row">
+		<div class="bottom-controls">
 			<div class="bottom-ctrl">
 				<span class="ctrl-label">SCALE</span>
 				<select class="sel sel-input" bind:this={scaleSelectEl} on:change={handleScaleChange}>
@@ -670,10 +679,40 @@
 				</select>
 			</div>
 			<div class="bottom-ctrl">
-				<span class="ctrl-label">AUTO INTERVAL</span>
+				<span class="ctrl-label">AUTO</span>
 				<div class="slider-row">
 					<input type="range" class="slider" min="0" max="127" value={$autoInterval} on:input={handleAutoIntervalInput} on:change={handleAutoIntervalChange}>
 					<span class="mv">{autoIntervalSec}s</span>
+				</div>
+			</div>
+			<div class="chain-ctrl chain1-ctrl">
+				<span class="chain-label c1">CH1</span>
+				<div class="bottom-ctrl">
+					<span class="ctrl-label">WAVE</span>
+					<select class="sel sel-chain1" bind:this={waveformSelect1El} on:change={handleWaveform1Change}>
+						{#each WAVEFORM_NAMES as name, i}<option value={i}>{name}</option>{/each}
+					</select>
+				</div>
+				<div class="bottom-ctrl">
+					<span class="ctrl-label">RANGE</span>
+					<button class="btn-toggle c1" class:active={$bassMode1} on:click={handleBassMode1Toggle}>
+						{$bassMode1 ? 'BASS' : 'FULL'}
+					</button>
+				</div>
+			</div>
+			<div class="chain-ctrl chain2-ctrl">
+				<span class="chain-label c2">CH2</span>
+				<div class="bottom-ctrl">
+					<span class="ctrl-label">WAVE</span>
+					<select class="sel sel-chain2" bind:this={waveformSelect2El} on:change={handleWaveform2Change}>
+						{#each WAVEFORM_NAMES as name, i}<option value={i}>{name}</option>{/each}
+					</select>
+				</div>
+				<div class="bottom-ctrl">
+					<span class="ctrl-label">RANGE</span>
+					<button class="btn-toggle c2" class:active={$bassMode2} on:click={handleBassMode2Toggle}>
+						{$bassMode2 ? 'BASS' : 'FULL'}
+					</button>
 				</div>
 			</div>
 		</div>
@@ -701,7 +740,6 @@
 				</div>
 			</div>
 		</div>
-		
 	</div>
 
 	<!-- ═══ Context menu ═══ -->
@@ -782,7 +820,8 @@
 		background: rgba(5, 5, 0, 0.92);
 		border-bottom: 1px solid #4a3d00;
 		padding: 8px 16px;
-		display: flex; align-items: center; gap: 16px;
+		display: flex; align-items: center; gap: 12px;
+		flex-wrap: wrap;
 		z-index: 20;
 	}
 	.hdr-rule {
@@ -940,24 +979,43 @@
 	/* ═══ Bottom bar ═══ */
 	.bottom-bar {
 		position: absolute; bottom: 0; right: 0;
-		display: flex; flex-direction: row; gap: 12px;
-		flex-wrap: wrap; 
-		align-items: center;
-		justify-content: space-around;
+		display: flex; flex-direction: column; gap: 8px;
 		background: rgba(5, 5, 0, 0.92);
-		/* border-top: 1px solid #4a3d00; */
 		padding: 8px 16px;
 		z-index: 20;
 	}
-	.bottom-top-row {
-		display: flex; gap: 20px; align-items: flex-end;
-		margin-bottom: 8px;
+	.bottom-controls {
+		display: flex; gap: 12px; align-items: center;
+		flex-wrap: wrap;
 	}
-	.bottom-ctrl { display: flex; align-items: center; gap: 8px; }
+	.bottom-ctrl { display: flex; align-items: center; gap: 6px; }
 	.ctrl-label {
 		font-size: 11px; color: #aa8800;
 		letter-spacing: 2px; white-space: nowrap;
 	}
+	.chain-ctrl {
+		display: flex; align-items: center; gap: 6px;
+		padding: 4px 8px;
+		border: 1px solid;
+	}
+	.chain1-ctrl { border-color: rgba(0, 229, 160, 0.25); }
+	.chain2-ctrl { border-color: rgba(0, 204, 255, 0.25); }
+	.chain-label {
+		font-size: 11px; letter-spacing: 2px; font-weight: bold;
+	}
+	.chain-label.c1 { color: #00e5a0; }
+	.chain-label.c2 { color: #00ccff; }
+	.sel-chain1 { color: #00e5a0; border-color: #004a35; }
+	.sel-chain1:focus { border-color: #00e5a0; }
+	.sel-chain2 { color: #00ccff; border-color: #003a4a; }
+	.sel-chain2:focus { border-color: #00ccff; }
+	.btn-toggle.c1 { color: #00e5a0; border-color: #004a35; }
+	.btn-toggle.c1:hover { background: rgba(0, 229, 160, 0.1); border-color: #00e5a0; }
+	.btn-toggle.c1.active { background: rgba(0, 229, 160, 0.15); border-color: #00e5a0; box-shadow: 0 0 6px rgba(0, 229, 160, 0.3); }
+	.btn-toggle.c2 { color: #00ccff; border-color: #003a4a; }
+	.btn-toggle.c2:hover { background: rgba(0, 204, 255, 0.1); border-color: #00ccff; }
+	.btn-toggle.c2.active { background: rgba(0, 204, 255, 0.15); border-color: #00ccff; box-shadow: 0 0 6px rgba(0, 204, 255, 0.3); }
+	.slider-row .slider { min-width: 80px; }
 	.kbd-section {
 		display: flex; flex-direction: column; gap: 4px;
 	}
@@ -967,6 +1025,7 @@
 	}
 	.keyboard {
 		display: flex; flex-direction: column; gap: 2px;
+		overflow-x: auto;
 	}
 	.kbd-black-row {
 		display: flex; flex-wrap: nowrap; gap: 3px;
@@ -982,6 +1041,69 @@
 	}
 	.note-btn.is-black.gap-after {
 		margin-right: 44px;
+	}
+
+	@media (max-width: 900px) {
+		.bottom-controls {
+			gap: 8px;
+		}
+		.chain-ctrl {
+			gap: 4px;
+			padding: 3px 6px;
+		}
+		.note-btn {
+			min-width: 36px;
+			padding: 4px 4px;
+			font-size: 11px;
+		}
+		.note-btn.is-black {
+			min-width: 30px;
+			padding: 3px 3px;
+			font-size: 10px;
+		}
+		.note-btn.is-black.gap-after {
+			margin-right: 36px;
+		}
+	}
+
+	@media (max-width: 700px) {
+		.bottom-bar {
+			padding: 6px 8px;
+		}
+		.bottom-controls {
+			gap: 6px;
+		}
+		.ctrl-label {
+			font-size: 10px;
+			letter-spacing: 1px;
+		}
+		.chain-label {
+			font-size: 10px;
+			letter-spacing: 1px;
+		}
+		.sel, .btn-toggle {
+			font-size: 11px;
+			padding: 3px 6px;
+		}
+		.note-btn {
+			min-width: 28px;
+			padding: 3px 2px;
+			font-size: 10px;
+		}
+		.note-btn.is-black {
+			min-width: 24px;
+			font-size: 9px;
+		}
+		.note-btn.is-black.gap-after {
+			margin-right: 28px;
+		}
+		.kbd-black-row {
+			padding-left: 16px;
+			gap: 2px;
+		}
+		.kbd-white-row {
+			gap: 2px;
+		}
 	}
 	.disclaimer {
 		position: fixed; bottom: 10px; left: 12px;
@@ -1058,6 +1180,14 @@
 	}
 	.btn-cancel { color: #ff6644; border-color: #4a2200; }
 	.btn-cancel:hover { background: rgba(255, 100, 68, 0.1); border-color: #ff6644; }
+	.btn-toggle {
+		background: transparent;
+		border: 1px solid;
+		padding: 4px 12px;
+		font-family: inherit; font-size: 12px; letter-spacing: 1px;
+		cursor: pointer; transition: all 0.15s;
+		min-width: 52px;
+	}
 
 	.sel {
 		background: rgba(5, 5, 0, 0.9); color: #ffcc00;

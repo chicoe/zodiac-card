@@ -46,3 +46,15 @@ export const scaleIndex = writable(1);
 
 /** @type {import('svelte/store').Writable<number>} */
 export const autoInterval = writable(61);
+
+/** @type {import('svelte/store').Writable<number>} */
+export const waveformIndex1 = writable(0);  // chain 1: 0=sine 1=triangle 2=square 3=pulse 4=sawtooth 5=supersaw 6=s+h 7=noise
+
+/** @type {import('svelte/store').Writable<boolean>} */
+export const bassMode1 = writable(false);   // chain 1 bass mode
+
+/** @type {import('svelte/store').Writable<number>} */
+export const waveformIndex2 = writable(0);  // chain 2 waveform
+
+/** @type {import('svelte/store').Writable<boolean>} */
+export const bassMode2 = writable(false);   // chain 2 bass mode

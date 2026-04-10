@@ -47,9 +47,11 @@ static constexpr uint32_t DEFAULT_STEP_INTERVAL= 24000;   // 500ms (~2 Hz)
 static constexpr uint32_t GATE_LENGTH_PCT      = 50;      // gate = 50% of step
 static constexpr uint32_t SINE_TABLE_SIZE      = 256;
 static constexpr int      NUM_SCALES           = 8;
+static constexpr int      NUM_WAVEFORMS        = 6;
+static constexpr int      BASS_THRESHOLD       = 47;  // MIDI notes above this get octave-shifted down in bass mode
 
 // Flash persistence — last 4KB sector
-// Layout: [0] magic | [1] scaleIndex | [2-5] autoInterval (uint32_t)
+// Layout: [0] magic | [1] scaleIndex | [2-5] autoInterval (uint32_t) | [6] waveform1 | [7] bassMode1 | [8] waveform2 | [9] bassMode2
 static constexpr uint8_t  FLASH_MAGIC         = 0xAC;
 static constexpr uint32_t FLASH_TARGET_OFFSET = PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE;
 
@@ -156,6 +158,8 @@ public:
     uint32_t gateDuration = 0;
     uint32_t sinePhase      = 0;
     uint32_t phaseIncrement = 0;
+    uint32_t sinePhase1b    = 0;   // supersaw detuned osc +
+    uint32_t sinePhase1c    = 0;   // supersaw detuned osc -
 
     // --- Chain 2 state (independent traversal, same graph) ---
     volatile int8_t  currentNode2 = -1;
@@ -167,6 +171,8 @@ public:
     uint32_t gateDuration2 = 0;
     uint32_t sinePhase2     = 0;
     uint32_t phaseIncrement2 = 0;
+    uint32_t sinePhase2b    = 0;
+    uint32_t sinePhase2c    = 0;
 
     // --- Switch gesture detection ---
     bool     prevSwitchUp     = true;   // init true to avoid false edge on boot
@@ -182,6 +188,10 @@ public:
     bool quantize = true;
     bool useChromatic = false;
     volatile uint8_t scaleIndex = 1;  // index into SCALES[], default Major
+    volatile uint8_t waveformIndex1 = 0;  // chain 1: 0=sine 1=triangle 2=square 3=pulse 4=sawtooth 5=supersaw
+    volatile bool    bassMode1 = false;   // chain 1 bass mode: fold notes above BASS_THRESHOLD down by octaves
+    volatile uint8_t waveformIndex2 = 0;  // chain 2 waveform
+    volatile bool    bassMode2 = false;   // chain 2 bass mode
 
     // --- MIDI CC numbers ---
     static constexpr uint8_t CC_CURRENT_NODE = 20;
@@ -193,6 +203,10 @@ public:
     static constexpr uint8_t CC_CURRENT_NODE2 = 26;
     static constexpr uint8_t CC_SCALE         = 27;
     static constexpr uint8_t CC_AUTO_INTERVAL  = 28;
+    static constexpr uint8_t CC_WAVEFORM      = 29;
+    static constexpr uint8_t CC_BASS_MODE     = 30;
+    static constexpr uint8_t CC_WAVEFORM2     = 31;
+    static constexpr uint8_t CC_BASS_MODE2    = 33;  // skip 32 (bank select LSB)
 
     // --- SysEx message types ---
     static constexpr uint8_t MSG_NODE         = 0x02;
@@ -203,6 +217,10 @@ public:
     static constexpr uint8_t MSG_SET_SCALE     = 0x14;
     static constexpr uint8_t MSG_ADD_NODE      = 0x15;
     static constexpr uint8_t MSG_SET_AUTO_INT   = 0x16;
+    static constexpr uint8_t MSG_SET_WAVEFORM   = 0x17;
+    static constexpr uint8_t MSG_SET_BASS_MODE  = 0x18;
+    static constexpr uint8_t MSG_SET_WAVEFORM2  = 0x19;
+    static constexpr uint8_t MSG_SET_BASS_MODE2 = 0x1A;
 
     uint8_t midiTxBuf[64];
     absolute_time_t nextMidiServiceTime;
@@ -246,6 +264,10 @@ public:
         buf[3] = (uint8_t)(ai >> 8);
         buf[4] = (uint8_t)(ai >> 16);
         buf[5] = (uint8_t)(ai >> 24);
+        buf[6] = (uint8_t)waveformIndex1;
+        buf[7] = bassMode1 ? 1u : 0u;
+        buf[8] = (uint8_t)waveformIndex2;
+        buf[9] = bassMode2 ? 1u : 0u;
 
         flashSaveActive = true;
         while (!core0InPause) tight_loop_contents();
@@ -254,6 +276,15 @@ public:
         flash_range_program(FLASH_TARGET_OFFSET, buf, FLASH_SECTOR_SIZE);
         restore_interrupts(ints);
         flashSaveActive = false;
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Bass mode: fold notes above BASS_THRESHOLD down by octaves
+    // ───────────────────────────────────────────────────────────
+    int32_t applyBassMode(int32_t midiNote, bool bm) {
+        if (!bm) return midiNote;
+        while (midiNote > BASS_THRESHOLD) midiNote -= 12;
+        return midiNote;
     }
 
     // ───────────────────────────────────────────────────────────
@@ -313,28 +344,76 @@ public:
         return pitch;
     }
 
-    uint32_t pitchToPhaseInc(int32_t pitch) {
+    uint32_t pitchToPhaseInc(int32_t pitch, bool bm) {
         float semitones;
         if (quantize) {
             int32_t midiNote = 36 + (pitch * 60 + 2048) / 4096;
             if (midiNote < 36) midiNote = 36;
             if (midiNote > 96) midiNote = 96;
             midiNote = (int32_t)quantizeToScale(midiNote);
+            midiNote = applyBassMode(midiNote, bm);
             semitones = (float)(midiNote - 69);
         } else {
             float fNote = 36.0f + (pitch * 60.0f) / 4096.0f;
-            semitones = fNote - 69.0f;
+            int32_t midiNote = (int32_t)fNote;
+            midiNote = applyBassMode(midiNote, bm);
+            semitones = (float)(midiNote - 69);
         }
         float freq = 440.0f * powf(2.0f, semitones / 12.0f);
         return (uint32_t)(freq * 65536.0f * SINE_TABLE_SIZE / SAMPLE_RATE);
     }
 
     void updatePhaseIncrement(int32_t pitch) {
-        phaseIncrement = pitchToPhaseInc(pitch);
+        phaseIncrement = pitchToPhaseInc(pitch, bassMode1);
+        sinePhase1b = sinePhase;  // sync supersaw oscillators to main phase
+        sinePhase1c = sinePhase;
     }
 
     void updatePhaseIncrement2(int32_t pitch) {
-        phaseIncrement2 = pitchToPhaseInc(pitch);
+        phaseIncrement2 = pitchToPhaseInc(pitch, bassMode2);
+        sinePhase2b = sinePhase2;
+        sinePhase2c = sinePhase2;
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Waveform rendering — called once per sample from ProcessSample
+    // idx: 8-bit phase index (0–255)
+    // phaseInc: phase increment for this chain
+    // phaseB/phaseC: supersaw extra oscillator phases (persistent state)
+    // ───────────────────────────────────────────────────────────
+    int16_t __not_in_flash_func(renderWaveform)(uint8_t idx, uint32_t phaseInc,
+            uint32_t &phaseB, uint32_t &phaseC, uint8_t waveIdx) {
+        // All waveforms target similar perceived loudness.
+        // Sine/triangle/supersaw: peak ±2047 (sine-like harmonic content).
+        // Square/pulse: ±1024 (−6dB, rich harmonics sound ~2× louder at equal amplitude).
+        // Sawtooth: ×0.625 (−4dB, bright harmonics but less extreme than square).
+        switch (waveIdx) {
+            case 0:  // Sine
+                return sineTable[idx];
+            case 1:  // Triangle
+                return (idx < 128)
+                    ? ((int16_t)idx * 32 - 2048)
+                    : (2047 - (int16_t)(idx - 128) * 32);
+            case 2:  // Square 50%
+                return (idx < 128) ? 1024 : -1024;
+            case 3:  // Pulse 25%
+                return (idx < 64) ? 1024 : -1024;
+            case 4:  // Sawtooth
+                return (int16_t)(((int32_t)(idx * 16 - 2048) * 5) >> 3);
+            case 5: {  // Supersaw (3 detuned sines, ±~13 cents)
+                phaseB += phaseInc + (phaseInc >> 7);
+                phaseC += phaseInc - (phaseInc >> 7);
+                int32_t s = (int32_t)sineTable[idx]
+                          + sineTable[(phaseB >> 16) & 0xFF]
+                          + sineTable[(phaseC >> 16) & 0xFF];
+                s = (s * 2) / 3;
+                if (s > 2047)  s = 2047;
+                if (s < -2047) s = -2047;
+                return (int16_t)s;
+            }
+            default:
+                return sineTable[idx];
+        }
     }
 
     // ───────────────────────────────────────────────────────────
@@ -843,6 +922,30 @@ public:
             scheduleSave();
             return;
         }
+
+        if (cmd == MSG_SET_WAVEFORM && size >= 2) {
+            uint8_t idx = data[1];
+            if (idx < NUM_WAVEFORMS) { waveformIndex1 = idx; scheduleSave(); }
+            return;
+        }
+
+        if (cmd == MSG_SET_BASS_MODE && size >= 2) {
+            bassMode1 = (data[1] != 0);
+            scheduleSave();
+            return;
+        }
+
+        if (cmd == MSG_SET_WAVEFORM2 && size >= 2) {
+            uint8_t idx = data[1];
+            if (idx < NUM_WAVEFORMS) { waveformIndex2 = idx; scheduleSave(); }
+            return;
+        }
+
+        if (cmd == MSG_SET_BASS_MODE2 && size >= 2) {
+            bassMode2 = (data[1] != 0);
+            scheduleSave();
+            return;
+        }
     }
 
     // ───────────────────────────────────────────────────────────
@@ -865,6 +968,7 @@ public:
         static int16_t lastCN = -2, lastNC = -1;
         static int16_t lastKM = -1, lastKX = -1, lastKY = -1, lastSW = -1;
         static int16_t lastCN2 = -2, lastScale = -1, lastAutoInt = -1;
+        static int16_t lastWaveform = -1, lastBassMode = -1, lastWaveform2 = -1, lastBassMode2 = -1;
         uint64_t now = time_us_64();
 
         // CC: Current node (send node ID, not array index)
@@ -914,6 +1018,34 @@ public:
             lastAutoInt = curAutoInt;
         }
 
+        // CC: Waveform index (chain 1)
+        int16_t curWaveform = (int16_t)waveformIndex1;
+        if (curWaveform != lastWaveform) {
+            SendCC(CC_WAVEFORM, (uint8_t)waveformIndex1);
+            lastWaveform = curWaveform;
+        }
+
+        // CC: Bass mode (chain 1)
+        int16_t curBassMode = bassMode1 ? 1 : 0;
+        if (curBassMode != lastBassMode) {
+            SendCC(CC_BASS_MODE, (uint8_t)curBassMode);
+            lastBassMode = curBassMode;
+        }
+
+        // CC: Waveform index (chain 2)
+        int16_t curWaveform2 = (int16_t)waveformIndex2;
+        if (curWaveform2 != lastWaveform2) {
+            SendCC(CC_WAVEFORM2, (uint8_t)waveformIndex2);
+            lastWaveform2 = curWaveform2;
+        }
+
+        // CC: Bass mode (chain 2)
+        int16_t curBassMode2 = bassMode2 ? 1 : 0;
+        if (curBassMode2 != lastBassMode2) {
+            SendCC(CC_BASS_MODE2, (uint8_t)curBassMode2);
+            lastBassMode2 = curBassMode2;
+        }
+
         // CC: Knobs at ~20 Hz
         static uint64_t lastKnobTime = 0;
         if (now - lastKnobTime >= 50000) {
@@ -932,6 +1064,7 @@ public:
             lastPeriodicTime = now;
             lastCN = -2; lastNC = -1; lastCN2 = -2; lastScale = -1; lastAutoInt = -1;
             lastKM = -1; lastKX = -1; lastKY = -1; lastSW = -1;
+            lastWaveform = -1; lastBassMode = -1; lastWaveform2 = -1; lastBassMode2 = -1;
         }
 
         // Handle full resync request
@@ -942,6 +1075,7 @@ public:
             }
             lastCN = -2; lastNC = -1; lastCN2 = -2; lastScale = -1; lastAutoInt = -1;
             lastKM = -1; lastKX = -1; lastKY = -1; lastSW = -1;
+            lastWaveform = -1; lastBassMode = -1; lastWaveform2 = -1; lastBassMode2 = -1;
         }
 
         // SysEx: Node sync (one node per ~10ms)
@@ -1142,12 +1276,12 @@ public:
         }
 
         // ═══════════════════════════════════════════
-        // 5. AUDIO — sine wave of current node pitch
+        // 5. AUDIO — waveform of current node pitch
         // ═══════════════════════════════════════════
         int16_t audioOut = 0;
         if (currentNode >= 0 && nodeCount > 0) {
             sinePhase += phaseIncrement;
-            audioOut = sineTable[(sinePhase >> 16) & 0xFF];
+            audioOut = renderWaveform((sinePhase >> 16) & 0xFF, phaseIncrement, sinePhase1b, sinePhase1c, waveformIndex1);
         }
         AudioOut1(audioOut);
 
@@ -1157,9 +1291,10 @@ public:
         if (currentNode >= 0 && nodeCount > 0) {
             int32_t pitch = nodes[currentNode].pitch;
             if (quantize) {
-                uint8_t midiNote = (uint8_t)(36 + (pitch * 60) / 4096);
+                int32_t midiNote = 36 + (pitch * 60) / 4096;
                 if (midiNote > 96) midiNote = 96;
-                CVOut1MIDINote(midiNote);
+                midiNote = applyBassMode(midiNote, bassMode1);
+                CVOut1MIDINote((uint8_t)midiNote);
             } else {
                 CVOut1((int16_t)(pitch - 2048));
             }
@@ -1227,7 +1362,7 @@ public:
         int16_t audioOut2 = 0;
         if (currentNode2 >= 0 && nodeCount > 0) {
             sinePhase2 += phaseIncrement2;
-            audioOut2 = sineTable[(sinePhase2 >> 16) & 0xFF];
+            audioOut2 = renderWaveform((sinePhase2 >> 16) & 0xFF, phaseIncrement2, sinePhase2b, sinePhase2c, waveformIndex2);
         }
         AudioOut2(audioOut2);
 
@@ -1235,9 +1370,10 @@ public:
         if (currentNode2 >= 0 && nodeCount > 0) {
             int32_t pitch2 = nodes[currentNode2].pitch;
             if (quantize) {
-                uint8_t midiNote2 = (uint8_t)(36 + (pitch2 * 60) / 4096);
+                int32_t midiNote2 = 36 + (pitch2 * 60) / 4096;
                 if (midiNote2 > 96) midiNote2 = 96;
-                CVOut2MIDINote(midiNote2);
+                midiNote2 = applyBassMode(midiNote2, bassMode2);
+                CVOut2MIDINote((uint8_t)midiNote2);
             } else {
                 CVOut2((int16_t)(pitch2 - 2048));
             }
@@ -1291,6 +1427,12 @@ void setup() {
         uint32_t ai;
         memcpy(&ai, &flash[2], sizeof(ai));
         if (ai >= 6000 && ai <= 192000) card.autoInterval = ai;
+        uint8_t wi = flash[6];
+        if (wi < NUM_WAVEFORMS) card.waveformIndex1 = wi;
+        card.bassMode1 = (flash[7] == 1);
+        uint8_t wi2 = flash[8];
+        if (wi2 < NUM_WAVEFORMS) card.waveformIndex2 = wi2;
+        card.bassMode2 = (flash[9] == 1);
     }
 
     card.nextMidiServiceTime = get_absolute_time();

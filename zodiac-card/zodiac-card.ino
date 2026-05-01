@@ -599,10 +599,13 @@ public:
                 }
             }
 
-            // Extra links: probability 0–4095 maps to 0–4 extra links
-            // 0% = 0 extra, ~25% = 1, ~50% = 2, ~75% = 3, ~99% = 4
-            int maxExtra = (int)((uint32_t)probability * 4 / 4095);
-            if (maxExtra > 4) maxExtra = 4;
+            // Extra links: each of 4 possible slots is rolled independently with
+            // probability `probability/4095`. Smooth binomial — 1% ≈ always 0 extras,
+            // 100% = always 4 extras, 50% averages 2.
+            int maxExtra = 0;
+            for (int t = 0; t < 4; t++) {
+                if ((fastRandom() % 4096) < probability) maxExtra++;
+            }
 
             for (int e = 0; e < maxExtra && n.linkCount < MAX_LINKS; e++) {
                 uint8_t randomTarget;

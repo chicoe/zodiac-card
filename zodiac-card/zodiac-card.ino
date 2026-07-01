@@ -7,7 +7,12 @@
   Core 1: MIDICore() — USB MIDI CC/SysEx to browser UI.
 
   Controls:
-    Knob X:   Speed for chain 1 (internal clock)
+    Knob X:   Clock control, role depends on what's patched into Pulse In 1/2:
+                - no clock in:   internal clock speed for both chains
+                - Pulse 1 only:  divide/multiply chain 1's clock to drive chain 2
+                - Pulse 2 only:  divide/multiply chain 2's clock to drive chain 1
+                - both patched:  auto-generation interval (only once the knob is moved)
+              Divide/multiply in 0.5 ratio steps: …÷2, ÷1.5, ×1, ×1.5, ×2… (center = ×1).
     Knob Main / CV 1:  Link probability for new nodes
     Knob Y / CV 2:     Pitch range for new nodes
     Switch Up:    Auto mode — creates a new node every N seconds (configurable)
@@ -15,8 +20,8 @@
     Switch Down flick:  Cycle to next scale
     MIDI Note On: Create node (note=pitch, velocity=probability)
 
-  Chain 1: internal clock (Knob X) or Pulse 1 → Audio 1, CV 1, Pulse 1
-  Chain 2: Pulse 2 clock (if connected) → Audio 2, CV 2, Pulse 2
+  Chain 1: Pulse 1 clock (if connected), else Knob X internal / derived → Audio 1, CV 1, Pulse 1
+  Chain 2: Pulse 2 clock (if connected), else Knob X internal / derived → Audio 2, CV 2, Pulse 2
 
   CC status (firmware → browser):
     CC 20: chain 1 current node ID (127 = none)
@@ -44,6 +49,18 @@ static constexpr uint32_t SAMPLE_RATE          = 24000;   // ProcessSample calle
 static constexpr uint32_t MIN_STEP_INTERVAL    = 2400;    // 50ms  (~20 Hz)
 static constexpr uint32_t MAX_STEP_INTERVAL    = 96000;   // 2s    (~0.5 Hz)
 static constexpr uint32_t DEFAULT_STEP_INTERVAL= 24000;   // 500ms (~2 Hz)
+
+// Clock divide/multiply — Knob X when exactly one clock input is patched.
+// Quantized in 0.5 ratio steps: …÷2, ÷1.5, ×1, ×1.5, ×2… (unity at knob center).
+// Level n (signed half-steps from unity): n>=0 multiplies clock by (2+n)/2, n<0 divides by (2-n)/2.
+static constexpr int32_t CLOCK_MULT_STEPS = 6;   // max multiply = 1 + 0.5*6 = ×4   ← tweak after testing
+static constexpr int32_t CLOCK_DIV_STEPS  = 6;   // max divide   = 1 + 0.5*6 = ÷4
+static constexpr int32_t CLOCK_KNOB_MOVE_THRESH = 64;  // Knob X motion (of 4095) that grabs auto-interval when both clocks patched
+
+// Clock is treated as 2 pulses per quarter note (Pocket Operator / Korg Volca standard).
+// UI BPM is musical BPM = steps-per-minute / CLOCK_PPQN.
+static constexpr uint32_t CLOCK_PPQN = 2;
+
 static constexpr uint32_t GATE_LENGTH_PCT      = 50;      // gate = 50% of step
 static constexpr uint32_t SINE_TABLE_SIZE      = 256;
 static constexpr int      NUM_SCALES           = 8;
@@ -184,6 +201,11 @@ public:
     uint32_t autoTimer        = 0;
     volatile uint32_t autoInterval = 4 * SAMPLE_RATE;  // default 4s (96000 samples)
 
+    // --- Knob X → auto-interval takeover (when both clock inputs are patched) ---
+    bool     bothClockPrev    = false;  // were both clocks connected last sample
+    bool     bothClockEngaged = false;  // has Knob X moved enough to grab the auto-interval
+    int32_t  bothClockKnobRef = 0;      // Knob X value captured when both-clock mode began
+
     // --- Quantization ---
     bool quantize = true;
     bool useChromatic = false;
@@ -210,6 +232,7 @@ public:
 
     // --- SysEx message types ---
     static constexpr uint8_t MSG_NODE         = 0x02;
+    static constexpr uint8_t MSG_CLOCK_STATUS = 0x03;  // FW→browser: per-chain BPM + divide/multiply factor
     static constexpr uint8_t MSG_DELETE_NODE   = 0x10;
     static constexpr uint8_t MSG_DELETE_LINK   = 0x11;
     static constexpr uint8_t MSG_ADD_LINK      = 0x12;
@@ -973,6 +996,7 @@ public:
         static int16_t lastCN2 = -2, lastScale = -1, lastAutoInt = -1;
         static int16_t lastWaveform = -1, lastBassMode = -1, lastWaveform2 = -1, lastBassMode2 = -1;
         static int8_t lastMidiNote1 = -1, lastMidiNote2 = -1;
+        static int32_t lastBpm1 = -1, lastBpm2 = -1, lastClkMode = -1, lastClkLevel = -999;
         uint64_t now = time_us_64();
 
         // CC: Current node (send node ID, not array index)
@@ -1086,6 +1110,42 @@ public:
             if (abs((int)ky - (int)lastKY) > 1) { SendCC(CC_KNOB_Y, ky); lastKY = ky; }
         }
 
+        // SysEx: Clock status (per-chain BPM + divide/multiply factor) at ~10 Hz, on change.
+        // BPM = steps per minute = 60 * SAMPLE_RATE / stepInterval (also the external clock rate in PPM).
+        static uint64_t lastClockTime = 0;
+        if (now - lastClockTime >= 100000) {
+            lastClockTime = now;
+
+            bool p1 = Connected(Input::Pulse1);
+            bool p2 = Connected(Input::Pulse2);
+            // 0 = both internal, 1 = Pulse1 drives (knob mult chain 2), 2 = Pulse2 drives (knob mult chain 1), 3 = both external
+            uint8_t clkMode = (p1 && p2) ? 3 : p1 ? 1 : p2 ? 2 : 0;
+
+            uint32_t si1 = stepInterval  ? stepInterval  : 1;
+            uint32_t si2 = stepInterval2 ? stepInterval2 : 1;
+            uint32_t bpm1 = 60u * SAMPLE_RATE / (si1 * CLOCK_PPQN);  // musical BPM (2 PPQN)
+            uint32_t bpm2 = 60u * SAMPLE_RATE / (si2 * CLOCK_PPQN);
+            if (bpm1 > 16383) bpm1 = 16383;   // clamp to 14-bit
+            if (bpm2 > 16383) bpm2 = 16383;
+
+            int32_t clkLevel = clockMultLevel(KnobVal(Knob::X));  // signed half-steps from unity
+
+            if ((int32_t)bpm1 != lastBpm1 || (int32_t)bpm2 != lastBpm2 ||
+                (int32_t)clkMode != lastClkMode || clkLevel != lastClkLevel) {
+                uint8_t buf[7];
+                buf[0] = MSG_CLOCK_STATUS;
+                buf[1] = clkMode;
+                buf[2] = (uint8_t)((bpm1 >> 7) & 0x7F);
+                buf[3] = (uint8_t)(bpm1 & 0x7F);
+                buf[4] = (uint8_t)((bpm2 >> 7) & 0x7F);
+                buf[5] = (uint8_t)(bpm2 & 0x7F);
+                buf[6] = (uint8_t)((clkLevel + 64) & 0x7F);  // bias +64 → unsigned 7-bit
+                SendSysEx(buf, 7);
+                lastBpm1 = bpm1; lastBpm2 = bpm2;
+                lastClkMode = clkMode; lastClkLevel = clkLevel;
+            }
+        }
+
         // Periodic full CC resend every 2s
         static uint64_t lastPeriodicTime = 0;
         if (now - lastPeriodicTime >= 2000000) {
@@ -1093,6 +1153,7 @@ public:
             lastCN = -2; lastNC = -1; lastCN2 = -2; lastScale = -1; lastAutoInt = -1;
             lastKM = -1; lastKX = -1; lastKY = -1; lastSW = -1;
             lastWaveform = -1; lastBassMode = -1; lastWaveform2 = -1; lastBassMode2 = -1;
+            lastBpm1 = -1; lastBpm2 = -1; lastClkMode = -1; lastClkLevel = -999;
         }
 
         // Handle full resync request
@@ -1104,6 +1165,7 @@ public:
             lastCN = -2; lastNC = -1; lastCN2 = -2; lastScale = -1; lastAutoInt = -1;
             lastKM = -1; lastKX = -1; lastKY = -1; lastSW = -1;
             lastWaveform = -1; lastBassMode = -1; lastWaveform2 = -1; lastBassMode2 = -1;
+            lastBpm1 = -1; lastBpm2 = -1; lastClkMode = -1; lastClkLevel = -999;
         }
 
         // SysEx: Node sync (one node per ~10ms)
@@ -1157,6 +1219,36 @@ public:
                 nodes[unsyncedIdx].synced = true;
             }
         }
+    }
+
+    // Clock divide/multiply level from Knob X: signed half-steps from unity (0 = ×1).
+    // Right half → +1..+CLOCK_MULT_STEPS (×1.5, ×2, …); left half → -1..-CLOCK_DIV_STEPS (÷1.5, ÷2, …).
+    // Rounded so unity occupies a symmetric band across the center detent, easy to land on.
+    int32_t clockMultLevel(int32_t knob) {
+        int32_t n;
+        if (knob >= 2048) {
+            n = ((int32_t)(knob - 2048) * CLOCK_MULT_STEPS + 1023) / 2047;
+            if (n > CLOCK_MULT_STEPS) n = CLOCK_MULT_STEPS;
+        } else {
+            n = -(((int32_t)(2048 - knob) * CLOCK_DIV_STEPS + 1024) / 2048);
+            if (n < -CLOCK_DIV_STEPS) n = -CLOCK_DIV_STEPS;
+        }
+        return n;
+    }
+
+    // Derive a driven chain's step interval from the other chain's clock and Knob X.
+    uint32_t derivedStepInterval(uint32_t base, int32_t knobX) {
+        int32_t n = clockMultLevel(knobX);
+        uint32_t iv;
+        if (n >= 0) {
+            // multiply clock by (2+n)/2 → interval shrinks
+            iv = (uint32_t)((uint64_t)base * 2 / (2 + n));
+        } else {
+            // divide clock by (2-n)/2 → interval grows  (n is negative)
+            iv = (uint32_t)((uint64_t)base * (2 - n) / 2);
+        }
+        if (iv < MIN_STEP_INTERVAL) iv = MIN_STEP_INTERVAL;
+        return iv;
     }
 
     // ───────────────────────────────────────────────────────────
@@ -1261,12 +1353,40 @@ public:
         }
 
         // ═══════════════════════════════════════════
-        // 3. CLOCK — advance chain
+        // 3. CLOCK — role of Knob X depends on patched clock inputs
         // ═══════════════════════════════════════════
-        bool externalClock = Connected(Input::Pulse1);
+        bool pulse1Connected = Connected(Input::Pulse1);
+        bool pulse2Connected = Connected(Input::Pulse2);
+
+        // Both clocks patched: Knob X takes over the auto-generation interval,
+        // but only once it has actually been moved (so plugging in doesn't snap it).
+        bool bothClocks = pulse1Connected && pulse2Connected;
+        if (bothClocks) {
+            int32_t kx = KnobVal(Knob::X);
+            if (!bothClockPrev) {
+                bothClockKnobRef = kx;      // remember start position, don't grab yet
+                bothClockEngaged = false;
+            }
+            if (!bothClockEngaged) {
+                int32_t d = kx - bothClockKnobRef;
+                if (d < 0) d = -d;
+                if (d > CLOCK_KNOB_MOVE_THRESH) bothClockEngaged = true;
+            }
+            if (bothClockEngaged) {
+                // Same range as the UI slider: 6000–192000 samples (0.25s–8s)
+                uint32_t ai = 6000 + ((uint32_t)kx * (192000 - 6000)) / 4095;
+                if (ai != autoInterval) {
+                    autoInterval = ai;
+                    pendingFlashSave = true;  // debounced 1s save on Core 1
+                }
+            }
+        }
+        bothClockPrev = bothClocks;
+
         bool shouldAdvance = false;
 
-        if (externalClock) {
+        if (pulse1Connected) {
+            // Chain 1 follows the external clock on Pulse In 1
             if (PulseIn1RisingEdge()) {
                 if (receivedFirstPulse && stepCounter >= MIN_STEP_INTERVAL) {
                     stepInterval = stepCounter;
@@ -1278,10 +1398,16 @@ public:
             stepCounter++;
         } else {
             receivedFirstPulse = false;
-            int32_t knobX = KnobVal(Knob::X);
-            stepInterval = MIN_STEP_INTERVAL
-                + ((uint32_t)(4095 - knobX)
-                   * (MAX_STEP_INTERVAL - MIN_STEP_INTERVAL)) / 4095;
+            if (pulse2Connected) {
+                // Only Pulse 2 patched: Knob X divides/multiplies chain 2's clock to drive chain 1
+                stepInterval = derivedStepInterval(stepInterval2, KnobVal(Knob::X));
+            } else {
+                // No external clock: Knob X sets chain 1's internal tempo directly
+                int32_t knobX = KnobVal(Knob::X);
+                stepInterval = MIN_STEP_INTERVAL
+                    + ((uint32_t)(4095 - knobX)
+                       * (MAX_STEP_INTERVAL - MIN_STEP_INTERVAL)) / 4095;
+            }
             stepCounter++;
             if (stepCounter >= stepInterval) {
                 stepCounter = 0;
@@ -1347,10 +1473,11 @@ public:
             gateActive2 = false;
         }
 
-        bool externalClock2 = Connected(Input::Pulse2);
+        // pulse1Connected / pulse2Connected computed in section 3 (same ProcessSample scope)
         bool shouldAdvance2 = false;
 
-        if (externalClock2) {
+        if (pulse2Connected) {
+            // Chain 2 follows the external clock on Pulse In 2
             if (PulseIn2RisingEdge()) {
                 if (receivedFirstPulse2 && stepCounter2 >= MIN_STEP_INTERVAL) {
                     stepInterval2 = stepCounter2;
@@ -1362,11 +1489,16 @@ public:
             stepCounter2++;
         } else {
             receivedFirstPulse2 = false;
-            // No external clock: use Knob X value directly
-            int32_t knobX2 = KnobVal(Knob::X);
-            stepInterval2 = MIN_STEP_INTERVAL
-                + ((uint32_t)(4095 - knobX2)
-                   * (MAX_STEP_INTERVAL - MIN_STEP_INTERVAL)) / 4095;
+            if (pulse1Connected) {
+                // Only Pulse 1 patched: Knob X divides/multiplies chain 1's clock to drive chain 2
+                stepInterval2 = derivedStepInterval(stepInterval, KnobVal(Knob::X));
+            } else {
+                // No external clock: Knob X sets chain 2's internal tempo directly
+                int32_t knobX2 = KnobVal(Knob::X);
+                stepInterval2 = MIN_STEP_INTERVAL
+                    + ((uint32_t)(4095 - knobX2)
+                       * (MAX_STEP_INTERVAL - MIN_STEP_INTERVAL)) / 4095;
+            }
             stepCounter2++;
             if (stepCounter2 >= stepInterval2) {
                 stepCounter2 = 0;

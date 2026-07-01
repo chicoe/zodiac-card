@@ -58,3 +58,15 @@ export const waveformIndex2 = writable(0);  // chain 2 waveform
 
 /** @type {import('svelte/store').Writable<boolean>} */
 export const bassMode2 = writable(false);   // chain 2 bass mode
+
+/** @type {import('svelte/store').Writable<number>} */
+export const bpm1 = writable(0);            // chain 1 tempo (steps/min), from firmware
+
+/** @type {import('svelte/store').Writable<number>} */
+export const bpm2 = writable(0);            // chain 2 tempo (steps/min), from firmware
+
+/** @type {import('svelte/store').Writable<number>} */
+export const clockMode = writable(0);       // 0=both internal, 1=ext drives seq1, 2=ext drives seq2, 3=both external
+
+/** @type {import('svelte/store').Writable<number>} */
+export const clockMultLevel = writable(0);  // Knob X divide/multiply level (signed half-steps; 0 = ×1)

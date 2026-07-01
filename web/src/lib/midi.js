@@ -16,7 +16,11 @@ import {
 	waveformIndex1,
 	bassMode1,
 	waveformIndex2,
-	bassMode2
+	bassMode2,
+	bpm1,
+	bpm2,
+	clockMode,
+	clockMultLevel
 } from './stores.js';
 
 // ── Protocol constants (must match firmware) ──
@@ -34,6 +38,7 @@ const CC_BASS_MODE = 30;
 const CC_WAVEFORM2 = 31;
 const CC_BASS_MODE2 = 33;
 const MSG_NODE = 0x02;
+const MSG_CLOCK_STATUS = 0x03;
 const MSG_DELETE_NODE = 0x10;
 const MSG_DELETE_LINK = 0x11;
 const MSG_ADD_LINK = 0x12;
@@ -257,6 +262,14 @@ function handleSysEx(data) {
 	if (data.length < 4 || data[1] !== MANUFACTURER_ID) return;
 	const payload = data.slice(2, data.length - 1);
 	if (payload.length === 0) return;
+
+	if (payload[0] === MSG_CLOCK_STATUS && payload.length >= 7) {
+		clockMode.set(payload[1]);
+		bpm1.set((payload[2] << 7) | payload[3]);
+		bpm2.set((payload[4] << 7) | payload[5]);
+		clockMultLevel.set(payload[6] - 64);   // undo firmware +64 bias → signed level
+		return;
+	}
 
 	if (payload[0] === MSG_NODE && payload.length >= 7) {
 		const nodeIdx = payload[1];

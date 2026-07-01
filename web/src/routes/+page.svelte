@@ -8,7 +8,8 @@
 		graphNodes, graphLinks, currentNodeId, currentNode2Id, nodeCount,
 		knobMain, knobX, knobY, switchState,
 		midiConnected, deviceNames, selectedDevice, scaleIndex, autoInterval,
-		waveformIndex1, bassMode1, waveformIndex2, bassMode2
+		waveformIndex1, bassMode1, waveformIndex2, bassMode2,
+		bpm1, bpm2, clockMode, clockMultLevel
 	} from '$lib/stores.js';
 
 	// ═══════════════════════════════════════════════════════════
@@ -177,7 +178,21 @@
 	function handleBassMode1Toggle() { sendSetBassMode1(!$bassMode1); }
 	function handleWaveform2Change(e) { sendSetWaveform2(parseInt(e.target.value)); }
 	function handleBassMode2Toggle() { sendSetBassMode2(!$bassMode2); }
-	$: speedBpm = Math.round(1440000 / (2400 + ((4095 - $knobX) * 93600) / 4095));
+	// Clock divide/multiply level (signed half-steps from unity) → display string. 0 = ×1.
+	function fmtMult(n) {
+		if (n >= 0) {
+			const m = 1 + 0.5 * n;             // ×1, ×1.5, ×2, …
+			return '×' + (Number.isInteger(m) ? m : m.toFixed(1));
+		}
+		const d = 1 - 0.5 * n;                 // n < 0 → ÷1.5, ÷2, …
+		return '÷' + (Number.isInteger(d) ? d : d.toFixed(1));
+	}
+	// clockMode: 0=both internal, 1=ext drives seq1 (knob mults seq2), 2=ext drives seq2 (knob mults seq1), 3=both external
+	$: clockModeLabel = ['INTERNAL', 'EXT · SEQ1', 'EXT · SEQ2', 'EXT · BOTH'][$clockMode] || '?';
+	$: multStr = $clockMode === 1 ? `${fmtMult($clockMultLevel)} SEQ2`
+		: $clockMode === 2 ? `${fmtMult($clockMultLevel)} SEQ1`
+		: $clockMode === 3 ? 'AUTO INT'
+		: '×1 BOTH';
 	$: rangeOct = ((1 + ($knobY * 35) / 4095) * 2 / 12).toFixed(1);
 	function handleKeyClick(midiNote) { sendNoteOn(midiNote, 100); }
 
@@ -625,8 +640,11 @@
 			<div class="meta-row"><span class="ml">N_NODES</span><span class="mv">{String($nodeCount).padStart(2, '0')}</span></div>
 			<div class="meta-row"><span class="ml">SEQ1_ID</span><span class="mv c1">{$currentNodeId >= 0 ? String($currentNodeId).padStart(3, '0') : '---'}</span></div>
 			<div class="meta-row"><span class="ml">SEQ2_ID</span><span class="mv c2">{$currentNode2Id >= 0 ? String($currentNode2Id).padStart(3, '0') : '---'}</span></div>
+			<div class="meta-row"><span class="ml">SEQ1_BPM</span><span class="mv c1">{$midiConnected ? $bpm1 : '---'}</span></div>
+			<div class="meta-row"><span class="ml">SEQ2_BPM</span><span class="mv c2">{$midiConnected ? $bpm2 : '---'}</span></div>
+			<div class="meta-row"><span class="ml">CLK_SRC</span><span class="mv">{$midiConnected ? clockModeLabel : '---'}</span></div>
+			<div class="meta-row"><span class="ml">CLK_MULT</span><span class="mv">{$midiConnected ? multStr : '---'}</span></div>
 			<div class="meta-row"><span class="ml">LINK_PROB</span><span class="mv">{Math.round(($knobMain / 4095) * 100)}%</span></div>
-			<div class="meta-row"><span class="ml">MAIN_SPEED</span><span class="mv">{speedBpm} BPM</span></div>
 			<div class="meta-row"><span class="ml">PITCH_RANGE</span><span class="mv">{rangeOct} OCT</span></div>
 			<div class="meta-row"><span class="ml">SWITCH_POS</span><span class="mv">{switchLabels[$switchState] || '?'}</span></div>
 		</details>

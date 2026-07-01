@@ -1,10 +1,30 @@
-# Zodiac Card — Development Context
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
 Zodiac Card (formerly "Chains Sequencer") is a Markov chain sequencer for the Music Thing Modular Workshop System Computer Module. It consists of RP2040 firmware and a SvelteKit web UI that communicate via USB MIDI.
 
 Nodes hold pitches, links set transition probabilities. Two independent chains traverse the network to generate scale-quantized melodies. The web UI displays a force-directed graph with an amber CRT visual theme.
+
+## Repository Layout
+
+Two independent codebases in one repo. **From the repo root, firmware lives in `zodiac-card/` and the web app lives in `web/`** (they are siblings — the web app is *not* under `zodiac-card/`).
+
+### Firmware (`zodiac-card/`) — C++ Arduino sketch, 3-layer class hierarchy
+
+- `ComputerCard.h` — **vendored upstream library** (ComputerCard by Chris Johnson, Workshop System). Hardware abstraction for knobs/switch/jacks/LEDs; drives the `ProcessSample` audio ISR. **Do not edit — it's third-party.** (Note: the library documents a 48kHz ISR, but this firmware's `SAMPLE_RATE` constant is `24000` and all timing math uses that value.)
+- `WebInterface.h` — `WebInterfaceComputerCard : ComputerCard`. Adds USB MIDI SysEx and launches core1 (`beginMIDI()`, `SendSysEx()`, MIDI manufacturer ID). Subclasses override `MIDICore()` and `ProcessIncomingSysEx()`.
+- `zodiac-card.ino` (~1500 lines) — `ZodiacCard : WebInterfaceComputerCard`. The actual app: graph model, `addNode`/`deleteNodeBody`/`advanceChain`, the `ProcessSample()` override, `MIDICore()`, and flash persistence. `setup()` calls `card.beginMIDI("Zodiac Card")`.
+
+### Web (`web/`) — SvelteKit 5, static build
+
+- `src/routes/+page.svelte` (~1300 lines) — **the entire UI in one monolithic component**: SVG force graph, sidebar, piano keyboard, context menus, animations.
+- `src/routes/+page.js` — sets `ssr = false` (client-only; WebMIDI needs the browser).
+- `src/lib/midi.js` — WebMIDI access, message parse/build, incremental sync, `autoConnect`.
+- `src/lib/stores.js` — Svelte writable stores (all app state).
+- `src/routes/+page.svelte.bak` — stale tracked backup; ignore it.
 
 ## Architecture
 
@@ -104,6 +124,9 @@ Node sync is incremental: one unsynced node per ~10ms via SysEx. `fullResyncRequ
 ### Pending Edit System
 Core 1 (MIDI) writes to `pendingEdit` struct, Core 0 consumes it at start of each `ProcessSample()`. Only one pending edit at a time (single slot).
 
+### Flash Persistence
+`scaleIndex` and `autoInterval` survive power cycles by being written to the **last 4KB flash sector** (`FLASH_MAGIC = 0xAC` header detects uninitialized flash). Writing flash requires disabling XIP, so both cores must run from RAM during the erase/write — this uses a **cooperative pause**, not `multicore_lockout` (which conflicts with the Earle Philhower core's FIFO/USB usage): Core 1 sets `flashSaveActive`, Core 0 spins inside `ProcessSample()` (marked `__not_in_flash_func`, so it runs from RAM), then Core 1 does the erase/program. `scheduleSave()` debounces writes by 1s. Full rationale in [`docs/flash-persistence.md`](docs/flash-persistence.md). **Any function that runs while flash is being written must be `__not_in_flash_func`.**
+
 ## Controls Mapping
 
 | Control | Firmware Variable | Function |
@@ -149,7 +172,7 @@ Core 1 (MIDI) writes to `pendingEdit` struct, Core 0 consumes it at start of eac
 - Orphan nodes (no incoming links) rendered at 40% opacity
 
 ### MIDI Connection
-- Auto-connects to device named "Chains" on page load
+- Auto-connects to a device whose name contains `Zodiac` or `pico` (case-insensitive), per `AUTO_DETECT_NAMES` in `midi.js` — the firmware's USB name is "Zodiac Card"
 - Falls back to single-device auto-connect
 - Device selector dropdown for manual selection
 - Requests full graph pull on connect
@@ -166,19 +189,27 @@ All state is in Svelte writable stores: `graphNodes`, `graphLinks`, `currentNode
 ## Build Commands
 
 ### Firmware
-1. Open `zodiac_card.ino` in Arduino IDE
+1. Open `zodiac-card/zodiac-card.ino` in Arduino IDE
 2. Select board: Raspberry Pi Pico
 3. Set USB Stack to "Pico SDK" (Tools menu)
 4. Requires [Earle Philhower RP2040 core](https://github.com/earlephilhower/arduino-pico) v5.5.0+
 5. Build & upload
 
+There is no CLI build for the firmware in this repo (Arduino IDE only). `zodiac-card/build/` holds a prebuilt `.uf2` artifact.
+
 ### Web UI
 ```bash
-cd zodiac-card/web
+cd web            # NOT zodiac-card/web — the web app is at the repo root
 npm install
-npm run dev      # development at localhost:5173
-npm run build    # static output in web/build/
+npm run dev       # development at localhost:5173
+npm run build     # static output in web/build/
+npm run preview   # serve the production build locally
 ```
+
+There is **no test or lint tooling** — `package.json` only defines `dev`, `build`, and `preview`. Don't hunt for a test runner.
+
+### Deployment
+`.github/workflows/deploy.yml` builds `web/` and publishes to GitHub Pages on every push to `main` (or via `workflow_dispatch`). For hosting under a subpath, set the `BASE_PATH` env var at build time (consumed in `svelte.config.js`).
 
 ## Design Decisions
 

@@ -83,6 +83,9 @@ export const rxMsgCount = writable(0);      // raw count of ALL incoming MIDI me
 /** @type {import('svelte/store').Writable<number>} */
 export const sysexRxCount = writable(0);    // count of complete SysEx messages received — splits "no SysEx arriving" from "SysEx misparsed"
 
+/** @type {import('svelte/store').Writable<{outName: string, outState: string, inputs: Array<{name: string, state: string, count: number, bound: boolean}>}>} */
+export const debugMidiInfo = writable({ outName: 'none', outState: '', inputs: [] }); // per-port RX stats for the ?debug=true panel
+
 /** @type {import('svelte/store').Writable<number>} */
 export const maxNodes = writable(16);       // runtime node cap (2–16), synced with firmware
 

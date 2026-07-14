@@ -25,6 +25,7 @@ import {
 	isrSections,
 	rxMsgCount,
 	sysexRxCount,
+	debugMidiInfo,
 	maxNodes,
 	noteTxChannel,
 	statusRxChannel
@@ -133,6 +134,47 @@ const internalNodes = new Map();
 let totalNodeCount = 0;
 let rosterMissingStreak = 0; // consecutive rosters listing nodes we don't have
 let sysexPartial = null;     // accumulator for SysEx split across events (Windows quirk)
+
+// ── Per-port RX statistics for the ?debug=true panel ──
+// Counting listeners attach via addEventListener, so they coexist with the
+// onmidimessage handlers and can never disturb the actual connection. This
+// reveals a card talking on a port we did NOT bind (a Windows failure mode).
+const portRxCounts = new Map();   // port.id → message count
+const portsTracked = new Set();   // port.ids that already have a counter
+let lastPortStatsPublish = 0;
+
+function trackPortStats(access) {
+	for (const input of access.inputs.values()) {
+		if (portsTracked.has(input.id)) continue;
+		portsTracked.add(input.id);
+		input.addEventListener('midimessage', () => {
+			portRxCounts.set(input.id, (portRxCounts.get(input.id) || 0) + 1);
+			publishPortStats();
+		});
+	}
+	publishPortStats(true);
+}
+
+function publishPortStats(force = false) {
+	if (!midiAccess) return;
+	const now = Date.now();
+	if (!force && now - lastPortStatsPublish < 250) return;
+	lastPortStatsPublish = now;
+	const inputs = [];
+	for (const input of midiAccess.inputs.values()) {
+		inputs.push({
+			name: input.name || input.id,
+			state: `${input.state}/${input.connection}`,
+			count: portRxCounts.get(input.id) || 0,
+			bound: input === midiInput
+		});
+	}
+	debugMidiInfo.set({
+		outName: midiOutput ? (midiOutput.name || '?') : 'none',
+		outState: midiOutput ? `${midiOutput.state}/${midiOutput.connection}` : '',
+		inputs
+	});
+}
 
 /** Clear local state and request a full graph dump from firmware */
 export function requestPull() {
@@ -516,6 +558,9 @@ function autoConnect(access, allowFallback = false) {
 
 	if (midiOutput && midiInput) {
 		connectedDeviceIsCard = isAutoDetectedName(midiOutput.name || '');
+		// Explicit open: attaching onmidimessage is meant to open implicitly,
+		// but Chrome on Windows has been seen not delivering until open()
+		try { midiInput.open(); midiOutput.open(); } catch { /* non-fatal */ }
 		midiConnected.set(true);
 		selectedDevice.set(midiOutput.name || '');
 		clearGraphState();
@@ -523,6 +568,7 @@ function autoConnect(access, allowFallback = false) {
 	} else {
 		midiConnected.set(false);
 	}
+	publishPortStats(true);
 }
 
 /** Forward Note On/Off from external MIDI controllers to the sequencer */
@@ -552,6 +598,7 @@ export async function connectMIDI() {
 		midiAccess = await navigator.requestMIDIAccess({ sysex: true });
 		autoConnect(midiAccess, true);   // explicit user connect → fallback allowed
 		setupExternalInputForwarding(midiAccess);
+		trackPortStats(midiAccess);
 		midiAccess.addEventListener('statechange', (event) => {
 			if (!midiAccess) return;
 			// If the state change is for our connected device, force-clear so
@@ -567,6 +614,7 @@ export async function connectMIDI() {
 			}
 			autoConnect(midiAccess);
 			setupExternalInputForwarding(midiAccess);
+			trackPortStats(midiAccess);
 		});
 	} catch (e) {
 		console.error('MIDI access denied:', e);
@@ -622,6 +670,7 @@ export function selectDevice(name) {
 
 	if (midiOutput && midiInput) {
 		connectedDeviceIsCard = isAutoDetectedName(name);
+		try { midiInput.open(); midiOutput.open(); } catch { /* non-fatal */ }
 		midiConnected.set(true);
 		selectedDevice.set(name);
 		clearGraphState();
@@ -630,4 +679,5 @@ export function selectDevice(name) {
 		midiConnected.set(false);
 		selectedDevice.set('');
 	}
+	publishPortStats(true);
 }

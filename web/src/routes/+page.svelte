@@ -10,7 +10,7 @@
 		midiConnected, deviceNames, selectedDevice, scaleIndex, autoInterval,
 		waveformIndex1, bassMode1, waveformIndex2, bassMode2,
 		bpm1, bpm2, clockMode, clockMultLevel, isrPeakUs, isrSections, rxMsgCount, sysexRxCount,
-		maxNodes, noteTxChannel, statusRxChannel
+		debugMidiInfo, maxNodes, noteTxChannel, statusRxChannel
 	} from '$lib/stores.js';
 
 	// ═══════════════════════════════════════════════════════════
@@ -687,6 +687,22 @@
 			<div class="meta-row"><span class="ml">PITCH_RANGE</span><span class="mv">{rangeOct} OCT</span></div>
 			<div class="meta-row"><span class="ml">SWITCH_POS</span><span class="mv">{switchLabels[$switchState] || '?'}</span></div>
 		</details>
+
+		{#if debugMode}
+			<details class="side-section" open on:click={toggleDetails}>
+				<summary class="side-title">MIDI DEBUG</summary>
+				<div class="meta-row"><span class="ml">OUT</span><span class="mv">{$debugMidiInfo.outName.slice(0, 16)}</span></div>
+				<div class="meta-row"><span class="ml">OUT_STATE</span><span class="mv">{$debugMidiInfo.outState || '---'}</span></div>
+				{#each $debugMidiInfo.inputs as p}
+					<div class="meta-row" title="{p.name} — {p.state}{p.bound ? ' (bound as sequencer input)' : ''}">
+						<span class="ml">{p.bound ? '▶' : '·'}{p.name.slice(0, 13)}</span>
+						<span class="mv">{p.count}</span>
+					</div>
+				{:else}
+					<div class="meta-row"><span class="ml">INPUTS</span><span class="mv">NONE</span></div>
+				{/each}
+			</details>
+		{/if}
 
 		<details class="side-section" open on:click={toggleDetails}>
 			<summary class="side-title">NODE LIST</summary>

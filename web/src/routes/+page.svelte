@@ -3,13 +3,14 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { base } from '$app/paths';
 	import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide } from 'd3-force';
-	import { connectMIDI, selectDevice, requestPull, sendDeleteNode, sendDeleteLink, sendAddLink, sendNoteOn, sendSetScale, sendSetAutoInterval, sendSetWaveform1, sendSetBassMode1, sendSetWaveform2, sendSetBassMode2 } from '$lib/midi.js';
+	import { connectMIDI, selectDevice, requestPull, sendDeleteNode, sendDeleteLink, sendAddLink, sendNoteOn, sendSetScale, sendSetAutoInterval, sendSetWaveform1, sendSetBassMode1, sendSetWaveform2, sendSetBassMode2, sendSetMaxNodes, setNoteTxChannel, setStatusRxChannel, isAutoDetectedName } from '$lib/midi.js';
 	import {
 		graphNodes, graphLinks, currentNodeId, currentNode2Id, nodeCount,
 		knobMain, knobX, knobY, switchState,
 		midiConnected, deviceNames, selectedDevice, scaleIndex, autoInterval,
 		waveformIndex1, bassMode1, waveformIndex2, bassMode2,
-		bpm1, bpm2, clockMode, clockMultLevel
+		bpm1, bpm2, clockMode, clockMultLevel, isrPeakUs, isrSections, rxMsgCount,
+		maxNodes, noteTxChannel, statusRxChannel
 	} from '$lib/stores.js';
 
 	// ═══════════════════════════════════════════════════════════
@@ -174,6 +175,28 @@
 	function handleAutoIntervalChange(e) { autoIntervalLocal = null; sendSetAutoInterval(parseInt(e.target.value)); }
 	$: autoIntervalDisplay = autoIntervalLocal ?? $autoInterval;
 	$: autoIntervalSec = (0.25 + (autoIntervalDisplay / 127) * (8 - 0.25)).toFixed(1);
+	let maxNodesLocal = null;
+	function handleMaxNodesInput(e) { maxNodesLocal = parseInt(e.target.value); }
+	function handleMaxNodesChange(e) { maxNodesLocal = null; sendSetMaxNodes(parseInt(e.target.value)); }
+	$: maxNodesDisplay = maxNodesLocal ?? $maxNodes;
+
+	// Diagnostics rows (ISR timing) only shown with ?debug=true in the URL
+	const debugMode = typeof window !== 'undefined'
+		&& new URLSearchParams(window.location.search).get('debug') === 'true';
+
+	// ═══ Performance mode — network only, everything else hidden ═══
+	let perfMode = false;
+	function handleKeydown(e) {
+		if (e.key === 'Escape' && perfMode) perfMode = false;
+	}
+	// Effective sidebar offset: zero when the sidebar is hidden in perf mode,
+	// so the SVG stretches to the full viewport and the network re-centers.
+	$: effSidebarW = perfMode ? 0 : sidebarW;
+
+	// Manual device routing (hub / IAC): channel pickers appear for non-card devices
+	$: isManualDevice = $selectedDevice && !isAutoDetectedName($selectedDevice);
+	function handleTxChChange(e) { setNoteTxChannel(parseInt(e.target.value)); }
+	function handleRxChChange(e) { setStatusRxChannel(parseInt(e.target.value)); }
 	function handleWaveform1Change(e) { sendSetWaveform1(parseInt(e.target.value)); }
 	function handleBassMode1Toggle() { sendSetBassMode1(!$bassMode1); }
 	function handleWaveform2Change(e) { sendSetWaveform2(parseInt(e.target.value)); }
@@ -426,10 +449,10 @@
 	});
 </script>
 
-<svelte:window on:click={dismissMenu} on:resize={handleResize} />
+<svelte:window on:click={dismissMenu} on:resize={handleResize} on:keydown={handleKeydown} />
 
 <div class="crt" bind:this={containerEl}>
-	<svg bind:this={svgEl} class="monitor" style="left: {sidebarW}px; width: calc(100% - {sidebarW}px);" viewBox="0 0 {WIDTH} {HEIGHT}">
+	<svg bind:this={svgEl} class="monitor" style="left: {effSidebarW}px; width: calc(100% - {effSidebarW}px);" viewBox="0 0 {WIDTH} {HEIGHT}">
 		<defs>
 			<pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
 				<path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1a1500" stroke-width="0.5" />
@@ -563,7 +586,7 @@
 	<div class="flicker"></div>
 
 	<!-- ═══ Header bar ═══ -->
-	<div class="header">
+	<div class="header" class:perf-hide={perfMode}>
 		<span class="title">ZODIAC SEQUENCER CARD</span>
 		<span class="subtitle"> | BETA v0.2.3</span>
 		<div class="hdr-rule"></div>
@@ -577,14 +600,24 @@
 					{#each $deviceNames as name}<option value={name}>{name}</option>{/each}
 				</select>
 			{/if}
+			{#if isManualDevice}
+				<select class="sel" value={$noteTxChannel} on:change={handleTxChChange} title="OUT: channel for notes we send to this device (e.g. IAC). Your router must deliver them to the card on CH 1.">
+					{#each Array(16) as _, i}<option value={i + 1}>OUT CH {i + 1}</option>{/each}
+				</select>
+				<select class="sel" value={$statusRxChannel} on:change={handleRxChChange} title="IN: only read status CCs arriving on this channel — use when the bus (e.g. IAC) carries other traffic. ANY = no filter.">
+					<option value={0}>IN CH ANY</option>
+					{#each Array(16) as _, i}<option value={i + 1}>IN CH {i + 1}</option>{/each}
+				</select>
+			{/if}
 			{#if $midiConnected}
 				<button class="btn" on:click={requestPull}>↻ PULL</button>
 			{/if}
+			<button class="btn" on:click={() => (perfMode = true)} title="Show only the network (Esc to exit)">◱ PERF MODE</button>
 		</div>
 	</div>
 
 	<!-- ═══ Left metadata panel ═══ -->
-	<div class="sidebar" bind:this={sidebarEl} on:click|stopPropagation>
+	<div class="sidebar" class:perf-hide={perfMode} bind:this={sidebarEl} on:click|stopPropagation>
 		<details class="side-section" open on:click={toggleDetails}>
 			<summary class="side-title">ABOUT</summary>
 			<div class="help-desc">
@@ -637,6 +670,7 @@
 
 		<details class="side-section" open on:click={toggleDetails}>
 			<summary class="side-title">STATUS</summary>
+			<div class="meta-row" title="All incoming MIDI messages, before any filtering"><span class="ml">MIDI_RX</span><span class="mv">{$rxMsgCount}</span></div>
 			<div class="meta-row"><span class="ml">N_NODES</span><span class="mv">{String($nodeCount).padStart(2, '0')}</span></div>
 			<div class="meta-row"><span class="ml">SEQ1_ID</span><span class="mv c1">{$currentNodeId >= 0 ? String($currentNodeId).padStart(3, '0') : '---'}</span></div>
 			<div class="meta-row"><span class="ml">SEQ2_ID</span><span class="mv c2">{$currentNode2Id >= 0 ? String($currentNode2Id).padStart(3, '0') : '---'}</span></div>
@@ -644,6 +678,10 @@
 			<div class="meta-row"><span class="ml">SEQ2_BPM</span><span class="mv c2">{$midiConnected ? $bpm2 : '---'}</span></div>
 			<div class="meta-row"><span class="ml">CLK_SRC</span><span class="mv">{$midiConnected ? clockModeLabel : '---'}</span></div>
 			<div class="meta-row"><span class="ml">CLK_MULT</span><span class="mv">{$midiConnected ? multStr : '---'}</span></div>
+			{#if debugMode}
+				<div class="meta-row"><span class="ml">ISR_PEAK</span><span class="mv" style={$isrPeakUs > 41 ? 'color:#ff5533' : ''}>{$midiConnected ? $isrPeakUs + 'µs' : '---'}</span></div>
+				<div class="meta-row" title="Per-section worst case: graph ops / control+clock / synthesis"><span class="ml">ISR_SECT</span><span class="mv">{$midiConnected ? `${$isrSections[0]}/${$isrSections[1]}/${$isrSections[2]}` : '---'}</span></div>
+			{/if}
 			<div class="meta-row"><span class="ml">LINK_PROB</span><span class="mv">{Math.round(($knobMain / 4095) * 100)}%</span></div>
 			<div class="meta-row"><span class="ml">PITCH_RANGE</span><span class="mv">{rangeOct} OCT</span></div>
 			<div class="meta-row"><span class="ml">SWITCH_POS</span><span class="mv">{switchLabels[$switchState] || '?'}</span></div>
@@ -681,14 +719,20 @@
 
 	<!-- ═══ Connect banner ═══ -->
 	{#if connectFromNode !== null}
-		<div class="banner" style="left: {sidebarW}px;">
+		<div class="banner" class:perf-hide={perfMode} style="left: {effSidebarW}px;">
 			⚠ SELECT TARGET FOR LINK FROM [{connectFromNode}] →
 			<button class="btn btn-cancel" on:click|stopPropagation={() => { connectFromNode = null; }}>CANCEL</button>
 		</div>
 	{/if}
 
+	<!-- ═══ Performance mode overlays ═══ -->
+	{#if perfMode}
+		<button class="perf-exit" on:click={() => (perfMode = false)} title="Exit performance mode (Esc)">✕</button>
+		<div class="perf-dot" class:on={$midiConnected} title={$midiConnected ? 'CONNECTED' : 'DISCONNECTED'}></div>
+	{/if}
+
 	<!-- ═══ Bottom controls & keyboard ═══ -->
-	<div class="bottom-bar" style="left: {sidebarW}px;">
+	<div class="bottom-bar" class:perf-hide={perfMode} style="left: {effSidebarW}px;">
 		<div class="bottom-controls">
 			<div class="bottom-ctrl">
 				<span class="ctrl-label">SCALE</span>
@@ -701,6 +745,13 @@
 				<div class="slider-row">
 					<input type="range" class="slider" min="0" max="127" value={$autoInterval} on:input={handleAutoIntervalInput} on:change={handleAutoIntervalChange}>
 					<span class="mv">{autoIntervalSec}s</span>
+				</div>
+			</div>
+			<div class="bottom-ctrl">
+				<span class="ctrl-label">NODES</span>
+				<div class="slider-row">
+					<input type="range" class="slider" min="2" max="64" step="1" value={$maxNodes} on:input={handleMaxNodesInput} on:change={handleMaxNodesChange}>
+					<span class="mv">{maxNodesDisplay}</span>
 				</div>
 			</div>
 			<div class="chain-ctrl chain1-ctrl">
@@ -798,6 +849,23 @@
 		background: radial-gradient(ellipse at center, transparent 60%, rgba(0,0,0,0.15) 90%, rgba(0,0,0,0.3) 100%);
 		pointer-events: none; z-index: 50;
 	}
+
+	/* ═══ Performance mode ═══ */
+	.perf-hide { display: none !important; }
+	.perf-exit {
+		position: absolute; top: 12px; left: 12px; z-index: 60;
+		width: 28px; height: 28px;
+		background: transparent; border: 1px solid #332b00; color: #806600;
+		font-family: inherit; font-size: 13px; line-height: 1;
+		cursor: pointer; opacity: 0.5; transition: opacity 0.15s;
+	}
+	.perf-exit:hover { opacity: 1; color: #ffcc00; border-color: #ffcc00; }
+	.perf-dot {
+		position: absolute; top: 18px; right: 18px; z-index: 60;
+		width: 10px; height: 10px; border-radius: 50%;
+		background: #402020;
+	}
+	.perf-dot.on { background: #00e5a0; box-shadow: 0 0 8px #00e5a0; }
 
 	/* Scan lines — subtle */
 	.scanlines {

@@ -14,7 +14,7 @@ Two independent codebases in one repo. **From the repo root, firmware lives in `
 
 ### Firmware (`zodiac-card/`) — C++ Arduino sketch, 3-layer class hierarchy
 
-- `ComputerCard.h` — **vendored upstream library** (ComputerCard by Chris Johnson, Workshop System). Hardware abstraction for knobs/switch/jacks/LEDs; drives the `ProcessSample` audio ISR. **Do not edit — it's third-party.** (Note: the library documents a 48kHz ISR, but this firmware's `SAMPLE_RATE` constant is `24000` and all timing math uses that value.)
+- `ComputerCard.h` — **vendored upstream library** (ComputerCard by Chris Johnson, Workshop System). Hardware abstraction for knobs/switch/jacks/LEDs; drives the `ProcessSample` audio ISR. **Treat as third-party — don't edit, with ONE deliberate exception:** a local patch in `BufferFull()` marked `ZODIAC PATCH (self-healing ADC)` re-aligns the ADC round-robin/FIFO once per second, because an overlong ISR (>~62µs, e.g. USB preemption stacking on DSP work) overflows the 4-deep ADC FIFO and permanently freezes all knob/switch/CV reads. If the vendored file is ever updated from upstream, **re-apply that patch**. (Note: the library documents a 48kHz ISR, but this firmware's `SAMPLE_RATE` constant is `24000` and all timing math uses that value.)
 - `WebInterface.h` — `WebInterfaceComputerCard : ComputerCard`. Adds USB MIDI SysEx and launches core1 (`beginMIDI()`, `SendSysEx()`, MIDI manufacturer ID). Subclasses override `MIDICore()` and `ProcessIncomingSysEx()`.
 - `zodiac-card.ino` (~1500 lines) — `ZodiacCard : WebInterfaceComputerCard`. The actual app: graph model, `addNode`/`deleteNodeBody`/`advanceChain`, the `ProcessSample()` override, `MIDICore()`, and flash persistence. `setup()` calls `card.beginMIDI("Zodiac Card")`.
 
@@ -47,7 +47,7 @@ Cross-core synchronization uses a **seqlock pattern** (`graphSeq`): Core 0 incre
 
 | Constant | Value | Notes |
 |----------|-------|-------|
-| MAX_NODES | 16 | Oldest auto-deleted when full |
+| MAX_NODES | 64 | Hard array cap; runtime cap via NODES slider (2–64, default 16), oldest auto-deleted when full |
 | MAX_LINKS | 8 | Per node |
 | SAMPLE_RATE | 24000 | ProcessSample rate (192kHz ADC / 8 DMA) |
 | Node IDs | 0–126 | Recycled, MIDI-safe 7-bit |

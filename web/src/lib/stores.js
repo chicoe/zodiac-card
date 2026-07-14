@@ -70,3 +70,21 @@ export const clockMode = writable(0);       // 0=both internal, 1=ext drives seq
 
 /** @type {import('svelte/store').Writable<number>} */
 export const clockMultLevel = writable(0);  // Knob X divide/multiply level (signed half-steps; 0 = ×1)
+
+/** @type {import('svelte/store').Writable<number>} */
+export const isrPeakUs = writable(0);       // worst-case ProcessSample µs in the last ~1s window (diagnostics; budget ≈ 41µs)
+
+/** @type {import('svelte/store').Writable<number[]>} */
+export const isrSections = writable([0, 0, 0]); // per-section worst case µs: [graph, control/clock, synthesis]
+
+/** @type {import('svelte/store').Writable<number>} */
+export const rxMsgCount = writable(0);      // raw count of ALL incoming MIDI messages (pre-filter) — connection diagnostics
+
+/** @type {import('svelte/store').Writable<number>} */
+export const maxNodes = writable(16);       // runtime node cap (2–16), synced with firmware
+
+/** @type {import('svelte/store').Writable<number>} */
+export const noteTxChannel = writable(1);   // 1-based channel for outgoing notes (firmware listens on ch 1)
+
+/** @type {import('svelte/store').Writable<number>} */
+export const statusRxChannel = writable(0); // channel filter for incoming status CCs (0 = any, 1–16 = specific)

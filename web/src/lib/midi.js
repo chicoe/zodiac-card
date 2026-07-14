@@ -20,7 +20,13 @@ import {
 	bpm1,
 	bpm2,
 	clockMode,
-	clockMultLevel
+	clockMultLevel,
+	isrPeakUs,
+	isrSections,
+	rxMsgCount,
+	maxNodes,
+	noteTxChannel,
+	statusRxChannel
 } from './stores.js';
 
 // ── Protocol constants (must match firmware) ──
@@ -37,8 +43,12 @@ const CC_WAVEFORM = 29;
 const CC_BASS_MODE = 30;
 const CC_WAVEFORM2 = 31;
 const CC_BASS_MODE2 = 33;
+const CC_MAX_NODES = 34;
 const MSG_NODE = 0x02;
 const MSG_CLOCK_STATUS = 0x03;
+const MSG_PERF = 0x04;
+const MSG_NODE_DELETED = 0x05;
+const MSG_ROSTER = 0x06;
 const MSG_DELETE_NODE = 0x10;
 const MSG_DELETE_LINK = 0x11;
 const MSG_ADD_LINK = 0x12;
@@ -50,6 +60,7 @@ const MSG_SET_WAVEFORM = 0x17;
 const MSG_SET_BASS_MODE = 0x18;
 const MSG_SET_WAVEFORM2 = 0x19;
 const MSG_SET_BASS_MODE2 = 0x1a;
+const MSG_SET_MAX_NODES = 0x1b;
 const MANUFACTURER_ID = 0x7d;
 
 /** @type {MIDIOutput | null} */
@@ -59,11 +70,67 @@ let midiInput = null;
 /** @type {MIDIAccess | null} */
 let midiAccess = null;
 
+// Configurable MIDI channels for non-Zodiac routing (hubs, IAC driver, DAWs).
+// The card itself is fixed: it listens for notes on ch 1, sends status CCs on
+// ch 1 and chain 1/2 notes on ch 2/3. When talking to an intermediary (IAC bus
+// that also carries other traffic), these set the channels *we* use on that
+// bus — the router is responsible for mapping them to the card's channels.
+// Persisted in localStorage so an IAC setup survives reloads.
+let noteTxCh = 0;    // 0-based channel for outgoing Note On (node creation)
+let statusRxCh = -1; // 0-based channel filter for incoming CCs; -1 = accept any
+let connectedDeviceIsCard = true; // filter only applies when routing via a non-card device
+
+const CHANNEL_STORAGE_KEY = 'zodiac-midi-channels';
+
+function saveChannelSettings() {
+	try {
+		localStorage.setItem(CHANNEL_STORAGE_KEY, JSON.stringify({
+			tx: noteTxCh + 1,
+			rx: statusRxCh < 0 ? 0 : statusRxCh + 1
+		}));
+	} catch { /* private mode etc. — non-fatal */ }
+}
+
+/** Set the 1-based channel used for outgoing notes */
+export function setNoteTxChannel(ch) {
+	noteTxCh = (ch - 1) & 0x0f;
+	noteTxChannel.set(ch);
+	saveChannelSettings();
+}
+
+/** Set the 1-based channel filter for incoming status CCs (0 = any) */
+export function setStatusRxChannel(ch) {
+	statusRxCh = ch <= 0 ? -1 : (ch - 1) & 0x0f;
+	statusRxChannel.set(ch);
+	saveChannelSettings();
+}
+
+// Restore persisted channel settings (browser only; ssr is disabled)
+if (typeof localStorage !== 'undefined') {
+	try {
+		const s = JSON.parse(localStorage.getItem(CHANNEL_STORAGE_KEY) || '{}');
+		if (Number.isInteger(s.tx) && s.tx >= 1 && s.tx <= 16) {
+			noteTxCh = (s.tx - 1) & 0x0f;
+			noteTxChannel.set(s.tx);
+		}
+		if (Number.isInteger(s.rx) && s.rx >= 1 && s.rx <= 16) {
+			statusRxCh = (s.rx - 1) & 0x0f;
+			statusRxChannel.set(s.rx);
+		}
+	} catch { /* corrupt entry — keep defaults */ }
+}
+
+/** True if a device name matches the auto-detect list (i.e. is the card itself) */
+export function isAutoDetectedName(name) {
+	return AUTO_DETECT_NAMES.some((k) => name && name.toLowerCase().includes(k.toLowerCase()));
+}
+
 
 // Internal node map for incremental sync (keyed by node ID)
 /** @type {Map<number, {pitch: number, links: Array<{target: number, weight: number}>}>} */
 const internalNodes = new Map();
 let totalNodeCount = 0;
+let rosterMissingStreak = 0; // consecutive rosters listing nodes we don't have
 
 /** Clear local state and request a full graph dump from firmware */
 export function requestPull() {
@@ -102,7 +169,7 @@ export function sendAddLink(sourceId, targetId, weight = 2048) {
 /** Send a MIDI Note On to create a node (note=pitch, velocity=probability) */
 export function sendNoteOn(note, velocity = 100) {
 	if (!midiOutput) return;
-	midiOutput.send([0x90, note & 0x7f, velocity & 0x7f]);
+	midiOutput.send([0x90 | noteTxCh, note & 0x7f, velocity & 0x7f]);
 }
 
 /** Send set scale command to firmware */
@@ -117,6 +184,13 @@ export function sendSetAutoInterval(val) {
 	autoInterval.set(val);
 	if (!midiOutput) return;
 	midiOutput.send([0xf0, MANUFACTURER_ID, MSG_SET_AUTO_INT, val & 0x7f, 0xf7]);
+}
+
+/** Send set max nodes command to firmware (2–16) */
+export function sendSetMaxNodes(val) {
+	maxNodes.set(val);
+	if (!midiOutput) return;
+	midiOutput.send([0xf0, MANUFACTURER_ID, MSG_SET_MAX_NODES, val & 0x7f, 0xf7]);
 }
 
 /** Send set waveform command for chain 1 (0–7) */
@@ -158,18 +232,6 @@ function clearGraphState() {
 	nodeCount.set(0);
 }
 
-/** Evict lowest-ID (oldest) entries from internalNodes until size <= target */
-function evictOldest(targetSize) {
-	while (internalNodes.size > targetSize) {
-		let minId = Infinity, minKey = null;
-		for (const id of internalNodes.keys()) {
-			if (id < minId) { minId = id; minKey = id; }
-		}
-		if (minKey !== null) internalNodes.delete(minKey);
-		else break;
-	}
-}
-
 /** Rebuild Svelte stores from internal node map */
 function rebuildGraph() {
 	/** @type {Array<{id: number, pitch: number, links: Array<{target: number, weight: number}>}>} */
@@ -198,10 +260,16 @@ function handleMIDI(event) {
 	const data = event.data;
 	if (!data || data.length === 0) return;
 
+	// Raw activity counter, before any filtering — proves the wire is alive
+	rxMsgCount.update((n) => n + 1);
+
 	const status = data[0] & 0xf0;
 
 	if (status === 0xb0 && data.length >= 3) {
-		// CC message
+		// CC message — the channel filter only applies when routing through a
+		// non-card device (IAC/hub). Direct card connections always pass:
+		// a persisted filter must never silently mute the card itself.
+		if (!connectedDeviceIsCard && statusRxCh >= 0 && (data[0] & 0x0f) !== statusRxCh) return;
 		const cc = data[1];
 		const val = data[2];
 		switch (cc) {
@@ -211,10 +279,6 @@ function handleMIDI(event) {
 			case CC_NODE_COUNT:
 				nodeCount.set(val);
 				totalNodeCount = val;
-				if (internalNodes.size > val) {
-					evictOldest(val);
-					rebuildGraph();
-				}
 				break;
 			case CC_KNOB_MAIN:
 				knobMain.set(val << 5);
@@ -249,6 +313,9 @@ function handleMIDI(event) {
 			case CC_BASS_MODE2:
 				bassMode2.set(val !== 0);
 				break;
+			case CC_MAX_NODES:
+				maxNodes.set(val);
+				break;
 		}
 	} else if (data[0] === 0xf0) {
 		// SysEx
@@ -262,6 +329,58 @@ function handleSysEx(data) {
 	if (data.length < 4 || data[1] !== MANUFACTURER_ID) return;
 	const payload = data.slice(2, data.length - 1);
 	if (payload.length === 0) return;
+
+	if (payload[0] === MSG_PERF && payload.length >= 3) {
+		isrPeakUs.set((payload[1] << 7) | payload[2]);
+		if (payload.length >= 9) {
+			isrSections.set([
+				(payload[3] << 7) | payload[4],
+				(payload[5] << 7) | payload[6],
+				(payload[7] << 7) | payload[8]
+			]);
+		}
+		return;
+	}
+
+	if (payload[0] === MSG_NODE_DELETED && payload.length >= 2) {
+		// Explicit deletion from firmware — exact, replaces the old
+		// "evict lowest ID on count drop" guess
+		if (internalNodes.delete(payload[1])) rebuildGraph();
+		return;
+	}
+
+	if (payload[0] === MSG_ROSTER && payload.length >= 2) {
+		// Authoritative list of live node IDs (every ~2s): prune anything
+		// the firmware no longer has; if we're missing nodes for two
+		// consecutive rosters, an incremental message was lost — re-pull.
+		const cnt = payload[1];
+		const liveIds = new Set();
+		for (let i = 0; i < cnt && 2 + i < payload.length; i++) liveIds.add(payload[2 + i]);
+
+		let changed = false;
+		for (const id of [...internalNodes.keys()]) {
+			if (!liveIds.has(id)) {
+				internalNodes.delete(id);
+				changed = true;
+			}
+		}
+
+		let missing = 0;
+		for (const id of liveIds) if (!internalNodes.has(id)) missing++;
+		if (missing > 0) {
+			rosterMissingStreak++;
+			if (rosterMissingStreak >= 2) {
+				rosterMissingStreak = 0;
+				requestPull();
+				return;
+			}
+		} else {
+			rosterMissingStreak = 0;
+		}
+
+		if (changed) rebuildGraph();
+		return;
+	}
 
 	if (payload[0] === MSG_CLOCK_STATUS && payload.length >= 7) {
 		clockMode.set(payload[1]);
@@ -292,13 +411,6 @@ function handleSysEx(data) {
 
 		internalNodes.set(nodeId, { pitch, links });
 		totalNodeCount = total;
-
-		// Evict stale entries: firmware deletes oldest (lowest ID) first,
-		// so remove lowest-ID entries until size matches total.
-		if (internalNodes.size > total) {
-			evictOldest(total);
-		}
-
 		rebuildGraph();
 	}
 }
@@ -320,7 +432,7 @@ function refreshDeviceList(access) {
 /** Names to auto-detect as the sequencer device */
 const AUTO_DETECT_NAMES = ['Zodiac', 'pico'];
 
-function autoConnect(access) {
+function autoConnect(access, allowFallback = false) {
 	refreshDeviceList(access);
 
 	// Skip if already connected to open ports (e.g. a different device's statechange)
@@ -351,8 +463,12 @@ function autoConnect(access) {
 		}
 	}
 
-	// If no known device found by name, try matching output+input by index
-	if (!midiOutput || !midiInput) {
+	// If no known device found by name, optionally fall back to a lone device.
+	// Only on an explicit user connect: on automatic statechange reconnects
+	// (e.g. the card resetting), falling back would silently grab whatever is
+	// left (IAC driver, a hub) — losing the card should just disconnect, and
+	// the card is re-grabbed by name when it reappears.
+	if ((!midiOutput || !midiInput) && allowFallback) {
 		const outputs = [...access.outputs.values()];
 		const inputs = [...access.inputs.values()];
 		if (outputs.length === 1 && inputs.length >= 1) {
@@ -363,6 +479,7 @@ function autoConnect(access) {
 	}
 
 	if (midiOutput && midiInput) {
+		connectedDeviceIsCard = isAutoDetectedName(midiOutput.name || '');
 		midiConnected.set(true);
 		selectedDevice.set(midiOutput.name || '');
 		clearGraphState();
@@ -377,9 +494,10 @@ function handleExternalMIDI(event) {
 	const data = event.data;
 	if (!data || data.length < 3 || !midiOutput) return;
 	const status = data[0] & 0xf0;
-	// Forward Note On and Note Off (channel 1 only) to the sequencer
+	// Forward Note On and Note Off (channel 1 only) to the sequencer,
+	// re-stamped onto the configured TX channel
 	if ((status === 0x90 || status === 0x80) && (data[0] & 0x0f) === 0) {
-		midiOutput.send([data[0], data[1], data[2]]);
+		midiOutput.send([status | noteTxCh, data[1], data[2]]);
 	}
 }
 
@@ -396,7 +514,7 @@ function setupExternalInputForwarding(access) {
 export async function connectMIDI() {
 	try {
 		midiAccess = await navigator.requestMIDIAccess({ sysex: true });
-		autoConnect(midiAccess);
+		autoConnect(midiAccess, true);   // explicit user connect → fallback allowed
 		setupExternalInputForwarding(midiAccess);
 		midiAccess.addEventListener('statechange', (event) => {
 			if (!midiAccess) return;
@@ -467,6 +585,7 @@ export function selectDevice(name) {
 	}
 
 	if (midiOutput && midiInput) {
+		connectedDeviceIsCard = isAutoDetectedName(name);
 		midiConnected.set(true);
 		selectedDevice.set(name);
 		clearGraphState();

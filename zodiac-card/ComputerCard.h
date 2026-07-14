@@ -631,6 +631,40 @@ void __not_in_flash_func(ComputerCard::BufferFull)()
 	dmaPhase = 1 - dmaPhase;
 
 	dma_hw->ints0 = 1u << adc_dma; // reset adc interrupt flag
+
+	// ═══ ZODIAC PATCH (self-healing ADC) — local addition to upstream ═══
+	// If this ISR ever runs past ~62µs (long DSP sample + USB preemption),
+	// the 4-deep ADC FIFO overflows and the channel↔buffer-slot alignment is
+	// silently corrupted: every knob/switch/CV read goes stale PERMANENTLY.
+	// Rather than trusting worst-case timing forever, re-align the ADC once
+	// per second at this point, where the DMA is between buffers:
+	// stop, wait out the in-flight conversion (≤2µs, so the drain below can
+	// never race a late sample), drain, reset round-robin to ch0, restart.
+	// Cost: one aborted conversion cycle per second, absorbed by the knob
+	// IIR smoothing. Bounds any misalignment to <1s instead of forever.
+	static int adcResyncCounter = 0;
+	if (++adcResyncCounter >= 24000 && runADCMode == RUN_ADC_MODE_RUNNING)
+	{
+		adcResyncCounter = 0;
+		adc_run(false);
+		while (!(adc_hw->cs & ADC_CS_READY_BITS)) tight_loop_contents();
+		// Abort the (idle) ADC DMA channel: this clears its DREQ credit
+		// counter. Draining the FIFO WITHOUT this leaves stale credits, and
+		// the DMA then reads one sample "early" forever — the re-sync itself
+		// would manufacture the exact misalignment it exists to repair.
+		dma_channel_abort(adc_dma);
+		dma_hw->ints0 = 1u << adc_dma;   // drop any IRQ the abort raised
+		adc_fifo_drain();
+		adc_fifo_setup(true, true, 1, false, false);  // re-init FIFO/DREQ (matches Run() init)
+		adc_set_round_robin(0);
+		adc_select_input(0);
+		adc_set_round_robin(0b0001111U);
+		adc_run(true);
+		// The normal dma_channel_set_write_addr(..., true) below re-arms the
+		// aborted channel from a clean state: fresh credits, aligned FIFO.
+	}
+	// ═══ end ZODIAC PATCH ═══
+
 	dma_channel_set_write_addr(adc_dma, ADC_Buffer[dmaPhase], true); // start writing into new buffer
 	dma_channel_set_read_addr(spi_dma, SPI_Buffer[dmaPhase], true); // start reading from new buffer
 

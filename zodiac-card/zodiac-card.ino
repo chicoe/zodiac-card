@@ -43,7 +43,12 @@
 // ═══════════════════════════════════════════════════════════════════
 // Constants
 // ═══════════════════════════════════════════════════════════════════
-static constexpr int      MAX_NODES            = 16;
+static constexpr int      MAX_NODES            = 64;  // hard array cap (indices must fit int8_t, IDs 0–126)
+static constexpr int      DEFAULT_MAX_NODES    = 16;  // default runtime cap (UI slider: 2..MAX_NODES)
+static constexpr int      REPAIR_SLICE         = 8;   // nodes processed per ISR tick during sliced graph ops.
+                                                      // Kept small: USB preemption can add ~25µs to any sample
+                                                      // (IRQ priorities are untouchable — see note in setup()),
+                                                      // so real work must leave that much headroom under ~62µs.
 static constexpr int      MAX_LINKS            = 8;
 static constexpr uint32_t SAMPLE_RATE          = 24000;   // ProcessSample called at 24kHz (192kHz ADC / 8 DMA transfers)
 static constexpr uint32_t MIN_STEP_INTERVAL    = 2400;    // 50ms  (~20 Hz)
@@ -56,6 +61,8 @@ static constexpr uint32_t DEFAULT_STEP_INTERVAL= 24000;   // 500ms (~2 Hz)
 static constexpr int32_t CLOCK_MULT_STEPS = 6;   // max multiply = 1 + 0.5*6 = ×4   ← tweak after testing
 static constexpr int32_t CLOCK_DIV_STEPS  = 6;   // max divide   = 1 + 0.5*6 = ÷4
 static constexpr int32_t CLOCK_KNOB_MOVE_THRESH = 64;  // Knob X motion (of 4095) that grabs auto-interval when both clocks patched
+static constexpr uint32_t CLOCK_BOTH_ARM_SAMPLES = 12000; // both clocks must read connected for 0.5s straight before Knob X can grab auto-interval (jack-detect can flicker on floating inputs)
+static constexpr int32_t  CLOCK_KNOB_JITTER      = 16;    // ignore Knob X wiggle below this while driving auto-interval
 
 // Clock is treated as 2 pulses per quarter note (Pocket Operator / Korg Volca standard).
 // UI BPM is musical BPM = steps-per-minute / CLOCK_PPQN.
@@ -68,9 +75,12 @@ static constexpr int      NUM_WAVEFORMS        = 6;
 static constexpr int      BASS_THRESHOLD       = 47;  // MIDI notes above this get octave-shifted down in bass mode
 
 // Flash persistence — last 4KB sector
-// Layout: [0] magic | [1] scaleIndex | [2-5] autoInterval (uint32_t) | [6] waveform1 | [7] bassMode1 | [8] waveform2 | [9] bassMode2
+// Layout: [0] magic | [1] scaleIndex | [2-5] autoInterval (uint32_t) | [6] waveform1 | [7] bassMode1 | [8] waveform2 | [9] bassMode2 | [10] maxNodes
 static constexpr uint8_t  FLASH_MAGIC         = 0xAC;
 static constexpr uint32_t FLASH_TARGET_OFFSET = PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE;
+// Each flash write pauses Core 0 for ~50ms — enforce a hard minimum gap so
+// noise-triggered save requests can never pile up into repeated stalls.
+static constexpr uint64_t FLASH_MIN_WRITE_SPACING_US = 10ULL * 1000000ULL;  // ≥10s between writes
 
 // ═══════════════════════════════════════════════════════════════════
 // Scale definitions — intervals from root (in semitones)
@@ -116,7 +126,7 @@ static void seedRNG() {
     if (rngState == 0) rngState = 12345;
 }
 
-static uint32_t fastRandom() {
+static uint32_t __not_in_flash_func(fastRandom)() {
     rngState ^= rngState << 13;
     rngState ^= rngState >> 17;
     rngState ^= rngState << 5;
@@ -149,13 +159,14 @@ public:
     // --- Graph state ---
     Node nodes[MAX_NODES];
     volatile int   nodeCount   = 0;
+    volatile uint8_t maxNodes  = DEFAULT_MAX_NODES;  // runtime node cap (2..MAX_NODES), set from UI, persisted
     volatile int8_t currentNode = -1;     // -1 = no nodes (array index)
     int8_t  lastCreatedNode = -1;          // last node added (array index)
     volatile uint32_t graphSeq = 0;       // seqlock for cross-core sync
     uint32_t nextBirthOrder = 0;           // monotonically increasing age counter
 
     // Allocate the smallest unused node ID in 0–126 range
-    uint8_t allocateNodeId() {
+    uint8_t __not_in_flash_func(allocateNodeId)() {
         bool used[127] = {};
         for (int i = 0; i < nodeCount; i++) {
             if (nodes[i].id < 127) used[nodes[i].id] = true;
@@ -163,7 +174,7 @@ public:
         for (uint8_t id = 0; id < 127; id++) {
             if (!used[id]) return id;
         }
-        return 0;  // fallback (shouldn't happen with MAX_NODES=16)
+        return 0;  // fallback (shouldn't happen while MAX_NODES ≤ 127)
     }
 
     // --- Chain 1 state ---
@@ -205,6 +216,37 @@ public:
     bool     bothClockPrev    = false;  // were both clocks connected last sample
     bool     bothClockEngaged = false;  // has Knob X moved enough to grab the auto-interval
     int32_t  bothClockKnobRef = 0;      // Knob X value captured when both-clock mode began
+    uint32_t bothClockStableCnt = 0;    // consecutive samples both clocks have read connected (debounce)
+    int32_t  bothClockLastKx  = -1000;  // last Knob X value applied to auto-interval (jitter gate)
+
+    // --- Deferred graph ops: at most ONE heavy op (evict/repair/create) per
+    // ISR sample, so ProcessSample never blows its ~41.6µs budget. Overruns
+    // starve the ADC DMA and permanently freeze all knob/switch reads. ---
+    int32_t  pendingCreatePitch = -1;   // >= 0: a node creation is queued (single slot)
+    uint16_t pendingCreateProb  = 0;
+    bool     needCleanup        = false;  // run orphan repair on the next sample
+
+    // Deleted-node IDs queued for UI notification (Core 0 writes, Core 1 drains)
+    volatile uint8_t deletedIds[64];
+    volatile uint8_t deletedHead = 0, deletedTail = 0;
+
+    // Sliced orphan repair: the full O(nodes·links) pass costs ~45µs at 64
+    // nodes — over budget in one sample — so it runs 16 nodes per tick.
+    // Any graph edit sets needCleanup, which (re)starts the repair from scratch.
+    uint8_t repairPhase    = 0;   // 0 idle, 1 scanning incoming links, 2 applying fixes
+    uint8_t repairCursor   = 0;
+    int8_t  repairYoungest = -1;
+    int8_t  repairOldest   = -1;
+    bool    repairIncoming[MAX_NODES] = {};
+
+    // Sliced delete link-fixup: after a swap-delete, the scan that removes
+    // links to the deleted slot / retargets links to the moved node runs 16
+    // nodes per tick (the full scan is ~500 link-touches on a dense 64-node
+    // graph ≈ 50µs — over budget in one sample). Between slices every link
+    // is index-valid; worst transient is a chain following a stale link once.
+    int8_t  delFixSlot   = -1;    // slot the deleted node occupied (moved node now lives there); -1 = idle
+    uint8_t delFixLast   = 0;     // old last index (now out of range; links there → delFixSlot)
+    uint8_t delFixCursor = 0;
 
     // --- Quantization ---
     bool quantize = true;
@@ -229,10 +271,14 @@ public:
     static constexpr uint8_t CC_BASS_MODE     = 30;
     static constexpr uint8_t CC_WAVEFORM2     = 31;
     static constexpr uint8_t CC_BASS_MODE2    = 33;  // skip 32 (bank select LSB)
+    static constexpr uint8_t CC_MAX_NODES     = 34;
 
     // --- SysEx message types ---
     static constexpr uint8_t MSG_NODE         = 0x02;
     static constexpr uint8_t MSG_CLOCK_STATUS = 0x03;  // FW→browser: per-chain BPM + divide/multiply factor
+    static constexpr uint8_t MSG_PERF         = 0x04;  // FW→browser: worst-case ProcessSample µs (diagnostics)
+    static constexpr uint8_t MSG_NODE_DELETED = 0x05;  // FW→browser: node ID removed from the graph
+    static constexpr uint8_t MSG_ROSTER       = 0x06;  // FW→browser: full list of live node IDs (safety net)
     static constexpr uint8_t MSG_DELETE_NODE   = 0x10;
     static constexpr uint8_t MSG_DELETE_LINK   = 0x11;
     static constexpr uint8_t MSG_ADD_LINK      = 0x12;
@@ -244,6 +290,7 @@ public:
     static constexpr uint8_t MSG_SET_BASS_MODE  = 0x18;
     static constexpr uint8_t MSG_SET_WAVEFORM2  = 0x19;
     static constexpr uint8_t MSG_SET_BASS_MODE2 = 0x1A;
+    static constexpr uint8_t MSG_SET_MAX_NODES  = 0x1B;
 
     uint8_t midiTxBuf[64];
     absolute_time_t nextMidiServiceTime;
@@ -260,6 +307,15 @@ public:
 
     // Set by Core 0 (switch flick), consumed by Core 1
     volatile bool pendingFlashSave = false;
+
+    // ISR timing probe — worst-case ProcessSample duration (µs) since the last
+    // MIDI report. Written by Core 0, read+reset by Core 1. Diagnostics for
+    // ADC-starvation debugging: budget is ~41.6µs per sample at 24kHz.
+    volatile uint32_t isrMaxUs = 0;
+    // Per-section maxima: A = graph ops, B = control/clock, C = synthesis+chain2.
+    // A structurally tiny section showing a large max = IRQ preemption landed
+    // there (wall-clock measurement), not real work.
+    volatile uint32_t isrMaxA = 0, isrMaxB = 0, isrMaxC = 0;
     // Core 1 sets flashSaveActive to pause Core 0 inside ProcessSample() (RAM)
     volatile bool flashSaveActive  = false;
     volatile bool core0InPause     = false;
@@ -291,6 +347,7 @@ public:
         buf[7] = bassMode1 ? 1u : 0u;
         buf[8] = (uint8_t)waveformIndex2;
         buf[9] = bassMode2 ? 1u : 0u;
+        buf[10] = (uint8_t)maxNodes;
 
         flashSaveActive = true;
         while (!core0InPause) tight_loop_contents();
@@ -304,7 +361,7 @@ public:
     // ───────────────────────────────────────────────────────────
     // Bass mode: fold notes above BASS_THRESHOLD down by octaves
     // ───────────────────────────────────────────────────────────
-    int32_t applyBassMode(int32_t midiNote, bool bm) {
+    int32_t __not_in_flash_func(applyBassMode)(int32_t midiNote, bool bm) {
         if (!bm) return midiNote;
         while (midiNote > BASS_THRESHOLD) midiNote -= 12;
         return midiNote;
@@ -343,7 +400,7 @@ public:
     // Quantization to scale happens only at playback time
     // Returns pitch value 0–4095
     // ───────────────────────────────────────────────────────────
-    int32_t randomPitchInRange(int32_t knobVal) {
+    int32_t __not_in_flash_func(randomPitchInRange)(int32_t knobVal) {
         // Center = MIDI 60 (C4), range = MIDI 36–96 (61 notes)
         static constexpr int CENTER = 60;
         static constexpr int LO = 36;
@@ -386,13 +443,13 @@ public:
         return (uint32_t)(freq * 65536.0f * SINE_TABLE_SIZE / SAMPLE_RATE);
     }
 
-    void updatePhaseIncrement(int32_t pitch) {
+    void __not_in_flash_func(updatePhaseIncrement)(int32_t pitch) {
         phaseIncrement = pitchToPhaseInc(pitch, bassMode1);
         sinePhase1b = sinePhase;  // sync supersaw oscillators to main phase
         sinePhase1c = sinePhase;
     }
 
-    void updatePhaseIncrement2(int32_t pitch) {
+    void __not_in_flash_func(updatePhaseIncrement2)(int32_t pitch) {
         phaseIncrement2 = pitchToPhaseInc(pitch, bassMode2);
         sinePhase2b = sinePhase2;
         sinePhase2c = sinePhase2;
@@ -442,7 +499,7 @@ public:
     // ───────────────────────────────────────────────────────────
     // Find index of youngest node (highest id), optionally excluding one
     // ───────────────────────────────────────────────────────────
-    int8_t findYoungestNode(int8_t excludeIdx = -1) {
+    int8_t __not_in_flash_func(findYoungestNode)(int8_t excludeIdx = -1) {
         int8_t best = -1;
         uint32_t bestAge = 0;
         for (int i = 0; i < nodeCount; i++) {
@@ -458,7 +515,7 @@ public:
     // ───────────────────────────────────────────────────────────
     // Find index of oldest node (lowest id)
     // ───────────────────────────────────────────────────────────
-    int8_t findOldestNode() {
+    int8_t __not_in_flash_func(findOldestNode)() {
         if (nodeCount == 0) return -1;
         int8_t best = 0;
         uint32_t bestAge = nodes[0].birthOrder;
@@ -474,7 +531,7 @@ public:
     // ───────────────────────────────────────────────────────────
     // Advance to next node via weighted random selection
     // ───────────────────────────────────────────────────────────
-    void advanceChain() {
+    void __not_in_flash_func(advanceChain)() {
         if (nodeCount == 0 || currentNode < 0) return;
 
         Node &cur = nodes[currentNode];
@@ -519,7 +576,7 @@ public:
     // ───────────────────────────────────────────────────────────
     // Advance chain 2 — independent traversal of the same graph
     // ───────────────────────────────────────────────────────────
-    void advanceChain2() {
+    void __not_in_flash_func(advanceChain2)() {
         if (nodeCount == 0 || currentNode2 < 0) return;
 
         Node &cur = nodes[currentNode2];
@@ -588,17 +645,14 @@ public:
     //   - all link weights are random
     //   - first node gets no initial links
     // ───────────────────────────────────────────────────────────
-    void addNode(int32_t pitch, uint16_t probability) {
+    void __not_in_flash_func(addNode)(int32_t pitch, uint16_t probability) {
         graphSeq++;  // begin atomic write — entire delete+cleanup+add is one operation
 
-        // At capacity: delete the oldest node (lowest id) to make room
-        if (nodeCount >= MAX_NODES) {
-            int8_t oldestIdx = findOldestNode();
-            if (oldestIdx >= 0) {
-                deleteNodeBody(oldestIdx);
-                cleanupStrayNodesBody();
-            }
-        }
+        // Hard-full guard. The deferred-ops scheduler evicts BEFORE calling
+        // addNode, so this should never trigger — but creating while full
+        // would write past the array, and evicting here would collide with
+        // the sliced delete fixup, so refuse instead.
+        if (nodeCount >= MAX_NODES) return;
 
         int newIdx = nodeCount;
         Node &n = nodes[newIdx];
@@ -676,41 +730,34 @@ public:
     }
 
     // ───────────────────────────────────────────────────────────
-    // Delete a node: remove it, fix all link targets, compact
+    // Delete a node — the cheap atomic part only: swap-with-last, playhead
+    // fixups, UI notification. The expensive link-fixup scan is armed here
+    // (delFixSlot) and completed in slices by the deferred-ops scheduler.
+    // Until the fixup finishes: links → delFixSlot (deleted) transiently hit
+    // the moved node; links → old last slot are out of range and advanceChain
+    // ignores them. Both are index-valid, so nothing can read garbage.
     // Does NOT touch graphSeq — caller must manage the seqlock.
     // ───────────────────────────────────────────────────────────
-    void deleteNodeBody(int8_t idx) {
+    void __not_in_flash_func(deleteNodeBody)(int8_t idx) {
         if (idx < 0 || idx >= nodeCount) return;
+        int8_t lastIdx = (int8_t)(nodeCount - 1);
 
-        // Remove links to deleted node from all other nodes, adjust targets
-        for (int i = 0; i < nodeCount; i++) {
-            if (i == idx) continue;
-            Node &n = nodes[i];
-            for (int j = 0; j < n.linkCount; ) {
-                if (n.links[j].target == (uint8_t)idx) {
-                    // Remove link by shifting
-                    for (int k = j; k < n.linkCount - 1; k++) {
-                        n.links[k] = n.links[k + 1];
-                    }
-                    n.linkCount--;
-                    n.synced = false;
-                } else {
-                    if (n.links[j].target > (uint8_t)idx) {
-                        n.links[j].target--;
-                    }
-                    j++;
-                }
-            }
-        }
+        // Queue UI notification (ring drained by Core 1 → MSG_NODE_DELETED)
+        deletedIds[deletedHead & 63] = nodes[idx].id;
+        deletedHead = (uint8_t)(deletedHead + 1);
 
-        // Shift nodes down to compact
-        for (int i = idx; i < nodeCount - 1; i++) {
-            nodes[i] = nodes[i + 1];
-            nodes[i].synced = false;
+        // Move the last node into the hole (single struct copy)
+        if (idx != lastIdx) {
+            nodes[idx] = nodes[lastIdx];
         }
         nodeCount--;
 
-        // Fix currentNode
+        // Arm the sliced link fixup (top priority in the deferred scheduler)
+        delFixSlot   = idx;
+        delFixLast   = (uint8_t)lastIdx;
+        delFixCursor = 0;
+
+        // Fix currentNode: deleted → re-pick, moved (was lastIdx) → follow
         if (nodeCount == 0) {
             currentNode = -1;
             phaseIncrement = 0;
@@ -718,8 +765,8 @@ public:
         } else if (currentNode == idx) {
             currentNode = (int8_t)(fastRandom() % nodeCount);
             updatePhaseIncrement(nodes[currentNode].pitch);
-        } else if (currentNode > idx) {
-            currentNode--;
+        } else if (currentNode == lastIdx) {
+            currentNode = idx;
         }
 
         // Fix currentNode2
@@ -730,8 +777,8 @@ public:
         } else if (currentNode2 == idx) {
             currentNode2 = (int8_t)(fastRandom() % nodeCount);
             updatePhaseIncrement2(nodes[currentNode2].pitch);
-        } else if (currentNode2 > idx) {
-            currentNode2--;
+        } else if (currentNode2 == lastIdx) {
+            currentNode2 = idx;
         }
 
         // Fix lastCreatedNode
@@ -739,18 +786,13 @@ public:
             lastCreatedNode = -1;
         } else if (lastCreatedNode == idx) {
             lastCreatedNode = -1;  // reset — next addNode will fall back to currentNode
-        } else if (lastCreatedNode > idx) {
-            lastCreatedNode--;
-        }
-
-        // Mark all nodes as unsynced after compaction (indices changed)
-        for (int i = 0; i < nodeCount; i++) {
-            nodes[i].synced = false;
+        } else if (lastCreatedNode == lastIdx) {
+            lastCreatedNode = idx;
         }
     }
 
     // Wrapper with seqlock for standalone delete calls
-    void deleteNode(int8_t idx) {
+    void __not_in_flash_func(deleteNode)(int8_t idx) {
         graphSeq++;
         deleteNodeBody(idx);
         graphSeq++;
@@ -759,7 +801,7 @@ public:
     // ───────────────────────────────────────────────────────────
     // Find array index by node ID. Returns -1 if not found.
     // ─────────────────────────────────────────────────────────────
-    int8_t findNodeByID(uint8_t id) {
+    int8_t __not_in_flash_func(findNodeByID)(uint8_t id) {
         for (int i = 0; i < nodeCount; i++) {
             if (nodes[i].id == id) return (int8_t)i;
         }
@@ -769,7 +811,7 @@ public:
     // ─────────────────────────────────────────────────────────────
     // Delete a specific link from a node (by source and target IDs)
     // ─────────────────────────────────────────────────────────────
-    void deleteLinkByID(uint8_t sourceId, uint8_t targetId) {
+    void __not_in_flash_func(deleteLinkByID)(uint8_t sourceId, uint8_t targetId) {
         int8_t srcIdx = findNodeByID(sourceId);
         int8_t tgtIdx = findNodeByID(targetId);
         if (srcIdx < 0 || tgtIdx < 0) return;
@@ -794,7 +836,7 @@ public:
     // ─────────────────────────────────────────────────────────────
     // Add a link between two nodes (by IDs)
     // ─────────────────────────────────────────────────────────────
-    void addLinkByID(uint8_t sourceId, uint8_t targetId, uint16_t weight) {
+    void __not_in_flash_func(addLinkByID)(uint8_t sourceId, uint8_t targetId, uint16_t weight) {
         int8_t srcIdx = findNodeByID(sourceId);
         int8_t tgtIdx = findNodeByID(targetId);
         if (srcIdx < 0 || tgtIdx < 0) return;
@@ -818,7 +860,7 @@ public:
     // ─────────────────────────────────────────────────────────────
     // Delete a node by ID
     // ─────────────────────────────────────────────────────────────
-    void deleteNodeByID(uint8_t id) {
+    void __not_in_flash_func(deleteNodeByID)(uint8_t id) {
         int8_t idx = findNodeByID(id);
         if (idx >= 0) deleteNode(idx);
     }
@@ -829,27 +871,28 @@ public:
     //   - Nodes with no outgoing links get a link to the oldest node
     // Does NOT touch graphSeq — caller must manage the seqlock.
     // ─────────────────────────────────────────────────────────────
-    void cleanupStrayNodesBody() {
+    void __not_in_flash_func(cleanupStrayNodesBody)() {
         if (nodeCount <= 1) return;
 
         int8_t youngestIdx = findYoungestNode();
         int8_t oldestIdx   = findOldestNode();
 
+        // One pass over all links: mark nodes that have an incoming link from
+        // another node. This runs inside the audio ISR — it must stay O(nodes·links).
+        // (The old per-node rescan was O(nodes²·links) ≈ 2000+ iterations at capacity,
+        // blowing the ~41µs sample budget and starving the ADC DMA.)
+        bool hasIncoming[MAX_NODES] = {};
+        for (int j = 0; j < nodeCount; j++) {
+            for (int k = 0; k < nodes[j].linkCount; k++) {
+                uint8_t t = nodes[j].links[k].target;
+                if (t < (uint8_t)nodeCount && t != (uint8_t)j) hasIncoming[t] = true;
+            }
+        }
+
         // Fix nodes with no incoming links: youngest → them
         for (int i = 0; i < nodeCount; i++) {
             if (i == youngestIdx) continue;  // youngest is the source, skip
-            bool hasIncoming = false;
-            for (int j = 0; j < nodeCount; j++) {
-                if (j == i) continue;
-                for (int k = 0; k < nodes[j].linkCount; k++) {
-                    if (nodes[j].links[k].target == (uint8_t)i) {
-                        hasIncoming = true;
-                        break;
-                    }
-                }
-                if (hasIncoming) break;
-            }
-            if (!hasIncoming && youngestIdx >= 0) {
+            if (!hasIncoming[i] && youngestIdx >= 0) {
                 Node &youngest = nodes[youngestIdx];
                 if (youngest.linkCount < MAX_LINKS) {
                     // Check not already linked
@@ -972,6 +1015,15 @@ public:
             scheduleSave();
             return;
         }
+
+        if (cmd == MSG_SET_MAX_NODES && size >= 2) {
+            uint8_t mn = data[1];
+            if (mn >= 2 && mn <= MAX_NODES) {
+                maxNodes = mn;   // Core 0 enforces (evicts surplus one per sample)
+                scheduleSave();
+            }
+            return;
+        }
     }
 
     // ───────────────────────────────────────────────────────────
@@ -984,8 +1036,15 @@ public:
             scheduleSave();
         }
         if (flashSaveDirty && time_us_64() >= flashSaveDeadline) {
-            flashSaveDirty = false;
-            saveToFlash();
+            // Hard spacing between writes: keeps retrying until the gap has
+            // passed, so the save still lands — just never back-to-back.
+            static uint64_t lastFlashWrite = 0;
+            uint64_t nowFW = time_us_64();
+            if (nowFW - lastFlashWrite >= FLASH_MIN_WRITE_SPACING_US) {
+                lastFlashWrite = nowFW;
+                flashSaveDirty = false;
+                saveToFlash();
+            }
         }
 
         if (!time_reached(nextMidiServiceTime)) return;
@@ -997,6 +1056,7 @@ public:
         static int16_t lastWaveform = -1, lastBassMode = -1, lastWaveform2 = -1, lastBassMode2 = -1;
         static int8_t lastMidiNote1 = -1, lastMidiNote2 = -1;
         static int32_t lastBpm1 = -1, lastBpm2 = -1, lastClkMode = -1, lastClkLevel = -999;
+        static int16_t lastMaxNodes = -1;
         uint64_t now = time_us_64();
 
         // CC: Current node (send node ID, not array index)
@@ -1098,6 +1158,13 @@ public:
             lastBassMode2 = curBassMode2;
         }
 
+        // CC: Max nodes
+        int16_t curMaxNodes = (int16_t)maxNodes;
+        if (curMaxNodes != lastMaxNodes) {
+            SendCC(CC_MAX_NODES, (uint8_t)curMaxNodes);
+            lastMaxNodes = curMaxNodes;
+        }
+
         // CC: Knobs at ~20 Hz
         static uint64_t lastKnobTime = 0;
         if (now - lastKnobTime >= 50000) {
@@ -1146,6 +1213,31 @@ public:
             }
         }
 
+        // SysEx: ISR timing probe report every ~1s (diagnostics)
+        static uint64_t lastPerfTime = 0;
+        if (now - lastPerfTime >= 1000000) {
+            lastPerfTime = now;
+            uint32_t us = isrMaxUs;
+            uint32_t uA = isrMaxA, uB = isrMaxB, uC = isrMaxC;
+            isrMaxUs = 0;   // reset measurement window
+            isrMaxA = 0; isrMaxB = 0; isrMaxC = 0;
+            if (us > 16383) us = 16383;
+            if (uA > 16383) uA = 16383;
+            if (uB > 16383) uB = 16383;
+            if (uC > 16383) uC = 16383;
+            uint8_t pbuf[9];
+            pbuf[0] = MSG_PERF;
+            pbuf[1] = (uint8_t)((us >> 7) & 0x7F);
+            pbuf[2] = (uint8_t)(us & 0x7F);
+            pbuf[3] = (uint8_t)((uA >> 7) & 0x7F);
+            pbuf[4] = (uint8_t)(uA & 0x7F);
+            pbuf[5] = (uint8_t)((uB >> 7) & 0x7F);
+            pbuf[6] = (uint8_t)(uB & 0x7F);
+            pbuf[7] = (uint8_t)((uC >> 7) & 0x7F);
+            pbuf[8] = (uint8_t)(uC & 0x7F);
+            SendSysEx(pbuf, 9);
+        }
+
         // Periodic full CC resend every 2s
         static uint64_t lastPeriodicTime = 0;
         if (now - lastPeriodicTime >= 2000000) {
@@ -1153,7 +1245,7 @@ public:
             lastCN = -2; lastNC = -1; lastCN2 = -2; lastScale = -1; lastAutoInt = -1;
             lastKM = -1; lastKX = -1; lastKY = -1; lastSW = -1;
             lastWaveform = -1; lastBassMode = -1; lastWaveform2 = -1; lastBassMode2 = -1;
-            lastBpm1 = -1; lastBpm2 = -1; lastClkMode = -1; lastClkLevel = -999;
+            lastBpm1 = -1; lastBpm2 = -1; lastClkMode = -1; lastClkLevel = -999; lastMaxNodes = -1;
         }
 
         // Handle full resync request
@@ -1165,12 +1257,50 @@ public:
             lastCN = -2; lastNC = -1; lastCN2 = -2; lastScale = -1; lastAutoInt = -1;
             lastKM = -1; lastKX = -1; lastKY = -1; lastSW = -1;
             lastWaveform = -1; lastBassMode = -1; lastWaveform2 = -1; lastBassMode2 = -1;
-            lastBpm1 = -1; lastBpm2 = -1; lastClkMode = -1; lastClkLevel = -999;
+            lastBpm1 = -1; lastBpm2 = -1; lastClkMode = -1; lastClkLevel = -999; lastMaxNodes = -1;
         }
 
-        // SysEx: Node sync (one node per ~10ms)
+        // SysEx: notify UI of deleted nodes. At most 2 per pass (~1ms) —
+        // a burst (cap slashed 20→5) would otherwise overflow the USB MIDI
+        // TX buffer and silently drop messages, leaving ghost nodes in the UI.
+        for (int d = 0; d < 2 && deletedTail != deletedHead; d++) {
+            uint8_t did = deletedIds[deletedTail & 63];
+            deletedTail = (uint8_t)(deletedTail + 1);
+            uint8_t dbuf[2] = { MSG_NODE_DELETED, (uint8_t)(did & 0x7F) };
+            SendSysEx(dbuf, 2);
+        }
+
+        // SysEx: roster broadcast every ~2s — the authoritative list of live
+        // node IDs. Lets the UI prune ghosts / detect gaps even if an
+        // incremental message was ever lost on the wire.
+        // Initialized to 1s so the roster grid sits between the 2s CC
+        // force-resend grid — keeps the two periodic bursts from stacking
+        // into one long USB service window (visible as ISR_PEAK spikes).
+        static uint64_t lastRosterTime = 1000000;
+        if (now - lastRosterTime >= 2000000 && deletedTail == deletedHead) {
+            lastRosterTime = now;
+            uint8_t ids[MAX_NODES];
+            int cnt = 0;
+            uint32_t rsA, rsB;
+            do {
+                rsA = graphSeq;
+                if (rsA & 1u) continue;
+                cnt = nodeCount;
+                if (cnt > MAX_NODES) cnt = MAX_NODES;
+                for (int i = 0; i < cnt; i++) ids[i] = nodes[i].id;
+                rsB = graphSeq;
+            } while (rsA != rsB || (rsB & 1u));
+
+            uint8_t rbuf[2 + MAX_NODES];
+            rbuf[0] = MSG_ROSTER;
+            rbuf[1] = (uint8_t)cnt;
+            for (int i = 0; i < cnt; i++) rbuf[2 + i] = ids[i] & 0x7F;
+            SendSysEx(rbuf, 2 + cnt);
+        }
+
+        // SysEx: Node sync (one node per ~3ms — a full 64-node resync in ~200ms)
         static uint64_t lastSysExTime = 0;
-        if (now - lastSysExTime >= 10000) {
+        if (now - lastSysExTime >= 3000) {
             uint32_t seqA, seqB;
             int unsyncedIdx = -1;
             Node snap;
@@ -1224,7 +1354,7 @@ public:
     // Clock divide/multiply level from Knob X: signed half-steps from unity (0 = ×1).
     // Right half → +1..+CLOCK_MULT_STEPS (×1.5, ×2, …); left half → -1..-CLOCK_DIV_STEPS (÷1.5, ÷2, …).
     // Rounded so unity occupies a symmetric band across the center detent, easy to land on.
-    int32_t clockMultLevel(int32_t knob) {
+    int32_t __not_in_flash_func(clockMultLevel)(int32_t knob) {
         int32_t n;
         if (knob >= 2048) {
             n = ((int32_t)(knob - 2048) * CLOCK_MULT_STEPS + 1023) / 2047;
@@ -1237,7 +1367,7 @@ public:
     }
 
     // Derive a driven chain's step interval from the other chain's clock and Knob X.
-    uint32_t derivedStepInterval(uint32_t base, int32_t knobX) {
+    uint32_t __not_in_flash_func(derivedStepInterval)(uint32_t base, int32_t knobX) {
         int32_t n = clockMultLevel(knobX);
         uint32_t iv;
         if (n >= 0) {
@@ -1255,13 +1385,17 @@ public:
     // ProcessSample — Core 0, 48kHz ISR
     // ───────────────────────────────────────────────────────────
     void __not_in_flash_func(ProcessSample)() override {
+        uint32_t isrT0 = time_us_32();  // ISR timing probe
 
         // ═══════════════════════════════════════════
         // 0. PROCESS PENDING EDITS FROM UI
         // ═══════════════════════════════════════════
         {
+            // Hold off on UI edits while a sliced delete fixup is running —
+            // e.g. an addLink to the moved node would be wrongly removed.
+            // The edit stays queued (single slot) and lands a few samples later.
             uint8_t cmd = pendingEdit.cmd;
-            if (cmd != 0) {
+            if (cmd != 0 && delFixSlot < 0) {
                 uint8_t nid = pendingEdit.nodeId;
                 uint8_t tid = pendingEdit.targetId;
                 uint16_t w  = pendingEdit.weight;
@@ -1269,10 +1403,10 @@ public:
 
                 if (cmd == MSG_DELETE_NODE) {
                     deleteNodeByID(nid);
-                    cleanupStrayNodes();
+                    needCleanup = true;   // orphan repair on a later sample
                 } else if (cmd == MSG_DELETE_LINK) {
                     deleteLinkByID(nid, tid);
-                    cleanupStrayNodes();
+                    needCleanup = true;
                 } else if (cmd == MSG_ADD_LINK) {
                     addLinkByID(nid, tid, w);
                 } else if (cmd == MSG_ADD_NODE) {
@@ -1284,10 +1418,143 @@ public:
                         ? (CVIn1() + 2048) : KnobVal(Knob::Main);
                     if (prob < 1)    prob = 1;
                     if (prob > 4095) prob = 4095;
-                    addNode(pitch, (uint16_t)prob);
+                    // Queue — the deferred-ops block below paces evict/create
+                    pendingCreatePitch = pitch;
+                    pendingCreateProb  = (uint16_t)prob;
                 }
             }
         }
+
+        // ═══════════════════════════════════════════
+        // 0.5 DEFERRED GRAPH OPS — at most ONE small op per sample.
+        // Eviction and creation get their own ISR tick; orphan repair is
+        // sliced 16 nodes per tick. Anything bigger overruns the ~41.6µs
+        // budget, starves the ADC DMA, and freezes all analog controls.
+        // ═══════════════════════════════════════════
+        if (needCleanup) {
+            // (Re)start sliced repair — also restarts cleanly if the graph
+            // changed mid-repair, since every edit path sets needCleanup.
+            needCleanup  = false;
+            repairPhase  = 1;
+            repairCursor = 0;
+            for (int i = 0; i < MAX_NODES; i++) repairIncoming[i] = false;
+        }
+
+        if (delFixSlot >= 0) {
+            // Sliced delete fixup: remove links to the deleted slot, retarget
+            // links to the old last slot (where the moved node used to live).
+            // Removal is checked first, so a link retargeted to delFixSlot in
+            // this pass is never mistaken for a stale link on a later slice.
+            graphSeq++;
+            int end = delFixCursor + REPAIR_SLICE;
+            if (end > nodeCount) end = nodeCount;
+            for (int j = delFixCursor; j < end; j++) {
+                Node &n = nodes[j];
+                for (int k = 0; k < n.linkCount; ) {
+                    uint8_t t = n.links[k].target;
+                    if (t == (uint8_t)delFixSlot) {
+                        for (int m = k; m < n.linkCount - 1; m++) {
+                            n.links[m] = n.links[m + 1];
+                        }
+                        n.linkCount--;
+                        n.synced = false;
+                    } else {
+                        if (t == delFixLast) {
+                            n.links[k].target = (uint8_t)delFixSlot;
+                        }
+                        k++;
+                    }
+                }
+            }
+            delFixCursor = (uint8_t)end;
+            if (delFixCursor >= nodeCount) {
+                delFixSlot  = -1;
+                needCleanup = true;   // orphan repair follows the fixup
+            }
+            graphSeq++;
+        } else if (repairPhase == 1) {
+            // Phase 1 (read-only): scan a slice of nodes, mark link targets
+            int end = repairCursor + REPAIR_SLICE;
+            if (end > nodeCount) end = nodeCount;
+            for (int j = repairCursor; j < end; j++) {
+                Node &n = nodes[j];
+                for (int k = 0; k < n.linkCount; k++) {
+                    uint8_t t = n.links[k].target;
+                    if (t < (uint8_t)nodeCount && t != (uint8_t)j) repairIncoming[t] = true;
+                }
+            }
+            repairCursor = (uint8_t)end;
+            if (repairCursor >= nodeCount) {
+                repairYoungest = findYoungestNode();
+                repairOldest   = findOldestNode();
+                repairPhase    = 2;
+                repairCursor   = 0;
+            }
+        } else if (repairPhase == 2) {
+            // Phase 2 (mutating, under seqlock): repair a slice of orphans
+            if (nodeCount <= 1) {
+                repairPhase = 0;
+            } else {
+                graphSeq++;
+                int end = repairCursor + REPAIR_SLICE;
+                if (end > nodeCount) end = nodeCount;
+                for (int j = repairCursor; j < end; j++) {
+                    // No incoming links: youngest → j
+                    if (j != repairYoungest && !repairIncoming[j]
+                        && repairYoungest >= 0 && repairYoungest < nodeCount) {
+                        Node &y = nodes[repairYoungest];
+                        if (y.linkCount < MAX_LINKS) {
+                            bool already = false;
+                            for (int k = 0; k < y.linkCount; k++) {
+                                if (y.links[k].target == (uint8_t)j) { already = true; break; }
+                            }
+                            if (!already) {
+                                y.links[y.linkCount].target = (uint8_t)j;
+                                y.links[y.linkCount].weight = (uint16_t)(1 + (fastRandom() % 4095));
+                                y.linkCount++;
+                                y.synced = false;
+                            }
+                        }
+                    }
+                    // No outgoing links: j → oldest
+                    if (nodes[j].linkCount == 0
+                        && repairOldest >= 0 && repairOldest != j && repairOldest < nodeCount) {
+                        nodes[j].links[0].target = (uint8_t)repairOldest;
+                        nodes[j].links[0].weight = (uint16_t)(1 + (fastRandom() % 4095));
+                        nodes[j].linkCount = 1;
+                        nodes[j].synced = false;
+                    }
+                }
+                graphSeq++;
+                repairCursor = (uint8_t)end;
+                if (repairCursor >= nodeCount) repairPhase = 0;
+            }
+        } else if (nodeCount > (int)maxNodes) {
+            // Cap lowered below current count: evict one oldest per visit
+            int8_t surplusIdx = findOldestNode();
+            if (surplusIdx >= 0) {
+                graphSeq++;
+                deleteNodeBody(surplusIdx);
+                graphSeq++;
+                needCleanup = true;
+            }
+        } else if (pendingCreatePitch >= 0) {
+            if (nodeCount >= (int)maxNodes) {
+                // Make room first; creation runs on a later sample
+                int8_t oldestIdx = findOldestNode();
+                if (oldestIdx >= 0) {
+                    graphSeq++;
+                    deleteNodeBody(oldestIdx);
+                    graphSeq++;
+                    needCleanup = true;
+                }
+            } else {
+                addNode(pendingCreatePitch, pendingCreateProb);
+                pendingCreatePitch = -1;
+            }
+        }
+
+        uint32_t isrTA = time_us_32();  // end of section A (graph ops)
 
         // ═══════════════════════════════════════════
         // 1. SWITCH STATE & QUANTIZATION
@@ -1333,7 +1600,7 @@ public:
         }
         prevSwitchDown = currentSwitchDown;
 
-        // --- Auto-create node on next sequence step ---
+        // --- Auto-create node: queue it for the deferred-ops block ---
         if (autoMakeNode) {
             autoMakeNode = false;
             int32_t pitch;
@@ -1349,7 +1616,8 @@ public:
                 : KnobVal(Knob::Main);
             if (prob < 1)     prob = 1;
             if (prob > 4095)  prob = 4095;
-            addNode(pitch, (uint16_t)prob);
+            pendingCreatePitch = pitch;
+            pendingCreateProb  = (uint16_t)prob;
         }
 
         // ═══════════════════════════════════════════
@@ -1364,22 +1632,39 @@ public:
         if (bothClocks) {
             int32_t kx = KnobVal(Knob::X);
             if (!bothClockPrev) {
-                bothClockKnobRef = kx;      // remember start position, don't grab yet
-                bothClockEngaged = false;
+                bothClockEngaged   = false;
+                bothClockStableCnt = 0;
             }
-            if (!bothClockEngaged) {
+            if (bothClockStableCnt < CLOCK_BOTH_ARM_SAMPLES) {
+                // Jack-detect debounce: floating inputs can flicker "connected",
+                // so require a solid 0.5s of both-connected before arming.
+                bothClockStableCnt++;
+                bothClockKnobRef = kx;   // track start position until armed
+            } else if (!bothClockEngaged) {
                 int32_t d = kx - bothClockKnobRef;
                 if (d < 0) d = -d;
-                if (d > CLOCK_KNOB_MOVE_THRESH) bothClockEngaged = true;
-            }
-            if (bothClockEngaged) {
-                // Same range as the UI slider: 6000–192000 samples (0.25s–8s)
-                uint32_t ai = 6000 + ((uint32_t)kx * (192000 - 6000)) / 4095;
-                if (ai != autoInterval) {
-                    autoInterval = ai;
-                    pendingFlashSave = true;  // debounced 1s save on Core 1
+                if (d > CLOCK_KNOB_MOVE_THRESH) {
+                    bothClockEngaged = true;
+                    bothClockLastKx  = kx;
                 }
             }
+            if (bothClockEngaged) {
+                // Jitter gate: only respond to real knob motion, not ADC noise
+                int32_t dk = kx - bothClockLastKx;
+                if (dk < 0) dk = -dk;
+                if (dk >= CLOCK_KNOB_JITTER) {
+                    bothClockLastKx = kx;
+                    // Same range as the UI slider: 6000–192000 samples (0.25s–8s)
+                    uint32_t ai = 6000 + ((uint32_t)kx * (192000 - 6000)) / 4095;
+                    if (ai != autoInterval) {
+                        autoInterval = ai;
+                        pendingFlashSave = true;  // debounced 1s save on Core 1
+                    }
+                }
+            }
+        } else {
+            bothClockEngaged   = false;
+            bothClockStableCnt = 0;
         }
         bothClockPrev = bothClocks;
 
@@ -1428,6 +1713,8 @@ public:
                 gateActive = false;
             }
         }
+
+        uint32_t isrTB = time_us_32();  // end of section B (control/clock)
 
         // ═══════════════════════════════════════════
         // 5. AUDIO — waveform of current node pitch
@@ -1562,6 +1849,18 @@ public:
             for (int i = 0; i < 6; i++) LedOff(i);
         }
 
+        // ISR timing probe — track worst case (measured before the flash pause,
+        // so it reflects real DSP/graph work, not the intentional save stall)
+        uint32_t isrTEnd = time_us_32();
+        uint32_t isrDt = isrTEnd - isrT0;
+        if (isrDt > isrMaxUs) isrMaxUs = isrDt;
+        uint32_t dA = isrTA - isrT0;
+        uint32_t dB = isrTB - isrTA;
+        uint32_t dC = isrTEnd - isrTB;
+        if (dA > isrMaxA) isrMaxA = dA;
+        if (dB > isrMaxB) isrMaxB = dB;
+        if (dC > isrMaxC) isrMaxC = dC;
+
         if (flashSaveActive) {
             core0InPause = true;
             while (flashSaveActive) tight_loop_contents();
@@ -1593,11 +1892,23 @@ void setup() {
         uint8_t wi2 = flash[8];
         if (wi2 < NUM_WAVEFORMS) card.waveformIndex2 = wi2;
         card.bassMode2 = (flash[9] == 1);
+        uint8_t mn = flash[10];
+        if (mn >= 2 && mn <= MAX_NODES) card.maxNodes = mn;  // 0xFF on pre-existing flash → keep default
     }
 
     card.nextMidiServiceTime = get_absolute_time();
     card.EnableNormalisationProbe();
     card.beginMIDI("Zodiac Card");
+
+    // NOTE: do NOT touch core-0 IRQ priorities. Both directions were tried
+    // and BOTH kill the MIDI stream (card enumerates but never transmits):
+    //   - demoting USBCTRL_IRQ below the audio DMA (0xC0)   → dead stream
+    //   - raising DMA_IRQ_0 above USB (0x00, USB untouched) → dead stream
+    // The USB stack evidently requires its IRQ to outrank the audio DMA.
+    // Consequence: USB preemption adds ~20-25µs to occasional ProcessSample
+    // wall times (visible in ISR_SECT as inflated no-op sections). That tax
+    // is tolerable as long as REAL ISR work stays small — the ADC FIFO only
+    // overflows past ~62µs total — so keep per-sample graph ops minimal.
 }
 
 void loop() {

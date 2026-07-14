@@ -24,6 +24,7 @@ import {
 	isrPeakUs,
 	isrSections,
 	rxMsgCount,
+	sysexRxCount,
 	maxNodes,
 	noteTxChannel,
 	statusRxChannel
@@ -131,12 +132,17 @@ export function isAutoDetectedName(name) {
 const internalNodes = new Map();
 let totalNodeCount = 0;
 let rosterMissingStreak = 0; // consecutive rosters listing nodes we don't have
+let sysexPartial = null;     // accumulator for SysEx split across events (Windows quirk)
 
 /** Clear local state and request a full graph dump from firmware */
 export function requestPull() {
 	if (!midiOutput) return;
 	clearGraphState();
 	midiOutput.send([0xf0, MANUFACTURER_ID, MSG_PULL_REQUEST, 0xf7]);
+	// CC fallback for the same request: some Windows MIDI stacks drop
+	// outgoing SysEx while passing channel messages — firmware treats
+	// CC 102 on channel 1 as an alternate pull request.
+	midiOutput.send([0xb0 | noteTxCh, 102, 127]);
 }
 
 /** Send delete node command to firmware */
@@ -263,6 +269,30 @@ function handleMIDI(event) {
 	// Raw activity counter, before any filtering — proves the wire is alive
 	rxMsgCount.update((n) => n + 1);
 
+	// Reassemble SysEx split across events (seen on some Windows MIDI
+	// stacks: the start chunk arrives without the terminating 0xF7).
+	if (sysexPartial) {
+		let aborted = false;
+		for (let i = 0; i < data.length; i++) {
+			const b = data[i];
+			if (b >= 0xf8) continue;               // realtime bytes may interleave
+			if (b >= 0x80 && b !== 0xf7) {         // new status byte → reassembly abandoned
+				sysexPartial = null;
+				aborted = true;
+				break;
+			}
+			sysexPartial.push(b);
+			if (b === 0xf7) {
+				const msg = Uint8Array.from(sysexPartial);
+				sysexPartial = null;
+				sysexRxCount.update((n) => n + 1);
+				handleSysEx(msg);
+				return;
+			}
+		}
+		if (!aborted) return;                      // consumed as continuation, still incomplete
+	}
+
 	const status = data[0] & 0xf0;
 
 	if (status === 0xb0 && data.length >= 3) {
@@ -318,8 +348,14 @@ function handleMIDI(event) {
 				break;
 		}
 	} else if (data[0] === 0xf0) {
-		// SysEx
-		handleSysEx(data);
+		if (data[data.length - 1] === 0xf7) {
+			// Complete SysEx in one event (the normal case)
+			sysexRxCount.update((n) => n + 1);
+			handleSysEx(data);
+		} else {
+			// Start of a split SysEx — accumulate until 0xF7 arrives
+			sysexPartial = [...data];
+		}
 	}
 }
 

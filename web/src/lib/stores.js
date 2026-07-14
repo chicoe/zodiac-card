@@ -81,6 +81,9 @@ export const isrSections = writable([0, 0, 0]); // per-section worst case µs: [
 export const rxMsgCount = writable(0);      // raw count of ALL incoming MIDI messages (pre-filter) — connection diagnostics
 
 /** @type {import('svelte/store').Writable<number>} */
+export const sysexRxCount = writable(0);    // count of complete SysEx messages received — splits "no SysEx arriving" from "SysEx misparsed"
+
+/** @type {import('svelte/store').Writable<number>} */
 export const maxNodes = writable(16);       // runtime node cap (2–16), synced with firmware
 
 /** @type {import('svelte/store').Writable<number>} */

@@ -117,6 +117,15 @@ public:
             }
             break;
         }
+        case 0x0B: // Control Change — channel 1 only. Used for fallback
+                   // commands: some Windows MIDI stacks drop browser→device
+                   // SysEx while passing plain channel messages.
+        {
+            if ((pkt.byte1 & 0x0F) == 0) {
+                ProcessIncomingCC(pkt.byte2 & 0x7F, pkt.byte3 & 0x7F);
+            }
+            break;
+        }
         }
     }
 
@@ -135,6 +144,7 @@ public:
     virtual void MIDICore() {}
     virtual void ProcessIncomingSysEx(uint8_t * /*data*/, uint32_t /*size*/) {}
     virtual void ProcessIncomingNoteOn(uint8_t /*note*/, uint8_t /*velocity*/) {}
+    virtual void ProcessIncomingCC(uint8_t /*cc*/, uint8_t /*value*/) {}
 
 private:
     static constexpr uint8_t MIDI_MANUFACTURER_ID = 0x7D; // prototyping/private use

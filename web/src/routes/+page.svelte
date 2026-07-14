@@ -9,7 +9,7 @@
 		knobMain, knobX, knobY, switchState,
 		midiConnected, deviceNames, selectedDevice, scaleIndex, autoInterval,
 		waveformIndex1, bassMode1, waveformIndex2, bassMode2,
-		bpm1, bpm2, clockMode, clockMultLevel, isrPeakUs, isrSections, rxMsgCount,
+		bpm1, bpm2, clockMode, clockMultLevel, isrPeakUs, isrSections, rxMsgCount, sysexRxCount,
 		maxNodes, noteTxChannel, statusRxChannel
 	} from '$lib/stores.js';
 
@@ -588,7 +588,7 @@
 	<!-- ═══ Header bar ═══ -->
 	<div class="header" class:perf-hide={perfMode}>
 		<span class="title">ZODIAC SEQUENCER CARD</span>
-		<span class="subtitle"> | BETA v0.2.3</span>
+		<span class="subtitle"> | BETA v0.3.0</span>
 		<div class="hdr-rule"></div>
 		<div class="conn-bar">
 			<button class="btn" class:connected={$midiConnected} on:click={connectMIDI}>
@@ -629,7 +629,7 @@
 				<br/>
 				<br/>To install, download the .UF2 file below, save it to the card and connect via USB MIDI (Chrome only).
 			</div>
-			<a class="btn btn-dl" href="{base}/zodiac-card-v0.2.uf2" download>⬇ DOWNLOAD .UF2</a>
+			<a class="btn btn-dl" href="{base}/zodiac-card-v0.3.uf2" download>⬇ DOWNLOAD .UF2</a>
 		</details>
 
 		<details class="side-section" on:click={toggleDetails}>
@@ -681,6 +681,7 @@
 			{#if debugMode}
 				<div class="meta-row"><span class="ml">ISR_PEAK</span><span class="mv" style={$isrPeakUs > 41 ? 'color:#ff5533' : ''}>{$midiConnected ? $isrPeakUs + 'µs' : '---'}</span></div>
 				<div class="meta-row" title="Per-section worst case: graph ops / control+clock / synthesis"><span class="ml">ISR_SECT</span><span class="mv">{$midiConnected ? `${$isrSections[0]}/${$isrSections[1]}/${$isrSections[2]}` : '---'}</span></div>
+				<div class="meta-row" title="Complete SysEx messages received (node data travels as SysEx)"><span class="ml">SYSEX_RX</span><span class="mv">{$sysexRxCount}</span></div>
 			{/if}
 			<div class="meta-row"><span class="ml">LINK_PROB</span><span class="mv">{Math.round(($knobMain / 4095) * 100)}%</span></div>
 			<div class="meta-row"><span class="ml">PITCH_RANGE</span><span class="mv">{rangeOct} OCT</span></div>

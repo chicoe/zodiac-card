@@ -639,6 +639,20 @@ public:
     }
 
     // ───────────────────────────────────────────────────────────
+    // Incoming CC → fallback commands (runs on Core 1).
+    // Some Windows MIDI stacks drop browser→device SysEx while passing
+    // plain channel messages, which left the UI connected but unable to
+    // request the graph (empty network, working knobs). The browser sends
+    // CC 102 alongside the SysEx pull request; either one triggers a resync.
+    // ───────────────────────────────────────────────────────────
+    static constexpr uint8_t CC_IN_PULL_REQUEST = 102;
+    void ProcessIncomingCC(uint8_t cc, uint8_t value) override {
+        if (cc == CC_IN_PULL_REQUEST && value > 0) {
+            fullResyncRequested = true;
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────
     // Add a new node to the graph
     //   - links youngest existing node → new node
     //   - extra random links based on probability (0–4 extra)

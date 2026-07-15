@@ -2,7 +2,8 @@
 	import '@fontsource/monaspace-krypton';
 	import { onMount, onDestroy } from 'svelte';
 	import { base } from '$app/paths';
-	import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide } from 'd3-force';
+	// 3D force graph (3d-force-graph + three) is imported dynamically in
+	// onMount — client-only, and keeps the initial bundle chunk lean.
 	import { connectMIDI, selectDevice, requestPull, sendDeleteNode, sendDeleteLink, sendAddLink, sendNoteOn, sendSetScale, sendSetAutoInterval, sendSetWaveform1, sendSetBassMode1, sendSetWaveform2, sendSetBassMode2, sendSetMaxNodes, setNoteTxChannel, setStatusRxChannel, isAutoDetectedName } from '$lib/midi.js';
 	import {
 		graphNodes, graphLinks, currentNodeId, currentNode2Id, nodeCount,
@@ -34,24 +35,8 @@
 		textMuted:  '#554400',
 	};
 
-	const RING_DUR_FAST = 500;
-	const RING_DUR_SLOW = 1200;
-	const PING_INTERVAL = 1800;
-	const TRAVEL_DUR = 120;
-	const NODE_HIT_R = 20;
-
 	function handleDeviceChange(e) { selectDevice(e.target.value); }
 
-	let WIDTH = 900;
-	let HEIGHT = 600;
-
-	let displayNodes = [];
-	let displayLinks = [];
-	let simulation = null;
-
-	let dragNode = null;
-	let didDrag = false;
-	let svgEl = null;
 	let containerEl = null;
 	let sidebarEl = null;
 	let sidebarW = 220;
@@ -60,8 +45,37 @@
 	let connectFromNode = null;
 	let focusedNodeId = null;
 
-	const positionMap = new Map();
-	let simNodes = [];
+	// ═══ 3D graph state ═══
+	let graphEl = null;          // container div for the 3D canvas
+	let graph3d = null;          // ForceGraph3D instance
+	let THREE = null;            // three module (dynamic import)
+	let SpriteText = null;       // three-spritetext ctor (dynamic import)
+	let starTexture = null;
+	const nodePool = new Map();  // node id → persistent sim-node object (keeps 3D positions across syncs)
+	let pulseFrameId = null;
+	let graphClickTs = 0;        // suppresses the window click-dismiss right after a canvas node/link click
+
+	// Camera auto-orbit: constant slow azimuth spin + slower polar sway
+	// (different rates per axis). Pauses while the user drags/zooms.
+	const ORBIT_AZ_SPEED  = 0.04;  // rad/s around the vertical axis
+	const ORBIT_POL_RATE  = 0.09;  // Hz-ish of the vertical sway oscillation
+	const ORBIT_POL_AMP   = 0.06;  // rad/s peak polar drift
+	let orbitPaused = false;
+	let orbitResumeTimer = null;
+	let lastAnimT = 0;
+	let _sph = null;               // reusable THREE.Spherical
+
+	// Star fade: untriggered nodes slowly dim to a floor; a playhead visit
+	// (or node creation) lights them back to full and restarts the fade.
+	const FADE_SECONDS = 30;
+	const MIN_GLOW = 0.06;
+
+	// Auto-fit: camera radius eases toward framing the whole constellation
+	const FIT_PADDING = 1.12;   // fraction of margin around the bounding sphere
+	const FIT_LERP    = 1.5;    // approach rate (per second)
+
+	// Sidebar list is driven straight from the store now (no 2D sim tick)
+	$: displayNodes = $graphNodes;
 
 	// ═══════════════════════════════════════════════════════════
 	// Pitch helpers
@@ -97,48 +111,362 @@
 		}));
 	}
 
-	function nodeRadius(pitch) { return 3 + (pitch / 4095) * 5; }
-
 	// ═══════════════════════════════════════════════════════════
-	// Force simulation
+	// 3D force graph — star-like glow sprites, dashed links
 	// ═══════════════════════════════════════════════════════════
-	function updateSimulation(nodes, links) {
-		if (simulation) simulation.stop();
-		simNodes = nodes.map((n) => {
-			const existing = positionMap.get(n.id);
-			return {
-				id: n.id, pitch: n.pitch,
-				x: existing?.x ?? WIDTH / 2 + (Math.random() - 0.5) * 100,
-				y: existing?.y ?? HEIGHT / 2 + (Math.random() - 0.5) * 100
-			};
-		});
-		const simLinks = links.map((l) => ({
-			source: simNodes.find((n) => n.id === l.source),
-			target: simNodes.find((n) => n.id === l.target),
-			weight: l.weight, sourceId: l.source, targetId: l.target
-		})).filter((l) => l.source && l.target);
 
-		simulation = forceSimulation(simNodes)
-			.force('link', forceLink(simLinks).id((d) => d.id).distance(120).strength(0.2))
-			.force('charge', forceManyBody().strength(-180))
-			.force('center', forceCenter(WIDTH / 2, HEIGHT / 2))
-			.force('collide', forceCollide(24))
-			.alphaDecay(0.05)
-			.on('tick', () => {
-				displayNodes = simNodes.map((n) => ({ id: n.id, pitch: n.pitch, x: n.x, y: n.y }));
-				displayLinks = simLinks.map((l) => ({
-					sourceId: l.sourceId, targetId: l.targetId,
-					x1: l.source.x, y1: l.source.y,
-					x2: l.target.x, y2: l.target.y,
-					weight: l.weight
-				}));
-				displayNodes.forEach((n) => positionMap.set(n.id, { x: n.x, y: n.y }));
-				if (simulation.alpha() < 0.01) simulation.stop();
-			});
+	// Soft radial glow — tinted per-node via the sprite material color
+	function makeStarTexture() {
+		const c = document.createElement('canvas');
+		c.width = c.height = 64;
+		const ctx = c.getContext('2d');
+		const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+		g.addColorStop(0, 'rgba(255,255,255,1)');
+		g.addColorStop(0.12, 'rgba(255,255,255,0.9)');
+		g.addColorStop(0.3, 'rgba(255,255,255,0.35)');
+		g.addColorStop(1, 'rgba(255,255,255,0)');
+		ctx.fillStyle = g;
+		ctx.fillRect(0, 0, 64, 64);
+		return new THREE.CanvasTexture(c);
 	}
 
-	function selfLoopPath(x, y) {
-		return `M ${x - 3} ${y - 10} C ${x - 22} ${y - 38} ${x + 22} ${y - 38} ${x + 3} ${y - 10}`;
+	function nodeBaseScale(pitch) { return 5 + (pitch / 4095) * 5; }
+
+	function labelFor(node) { return nodeLabels.get(node.id) || ''; }
+
+	// ═══ Star shader — gaussian core, soft halo, diffraction spikes,
+	// per-star shimmer. Billboarded in the vertex shader (the quad is
+	// expanded in view space, so it always faces the camera).
+	function makeStarMaterial() {
+		return new THREE.ShaderMaterial({
+			transparent: true,
+			depthWrite: false,
+			blending: THREE.AdditiveBlending,
+			uniforms: {
+				uColor:     { value: new THREE.Color(C.primary) },
+				uIntensity: { value: 1 },
+				uScale:     { value: 6 },
+				uTime:      { value: 0 },
+				uSeed:      { value: Math.random() * 6.2832 }
+			},
+			vertexShader: `
+				uniform float uScale;
+				varying vec2 vP;
+				void main() {
+					vP = position.xy;
+					vec4 mv = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+					mv.xy += position.xy * uScale;
+					gl_Position = projectionMatrix * mv;
+				}
+			`,
+			fragmentShader: `
+				uniform vec3  uColor;
+				uniform float uIntensity;
+				uniform float uTime;
+				uniform float uSeed;
+				varying vec2 vP;
+				void main() {
+					float r = length(vP);
+					// white-hot core
+					float core = exp(-r * r * 22.0);
+					// wide soft halo
+					float halo = exp(-r * 4.0) * 0.35;
+					// 4-point diffraction spikes, slowly breathing
+					float ax = abs(vP.x), ay = abs(vP.y);
+					float spikeLen = 4.5 - 1.2 * sin(uTime * 0.9 + uSeed);
+					float spikes = (exp(-ay * 34.0) * exp(-ax * spikeLen)
+					              + exp(-ax * 34.0) * exp(-ay * spikeLen)) * 0.55;
+					// gentle twinkle, dephased per star
+					float tw = 0.88 + 0.12 * sin(uTime * 2.7 + uSeed * 3.1);
+					float a = (core + halo + spikes) * uIntensity * tw;
+					vec3 col = mix(uColor, vec3(1.0), core * 0.65);
+					gl_FragColor = vec4(col * a, a);
+				}
+			`
+		});
+	}
+
+	let _planeGeo = null, _hitGeo = null, _hitMat = null;
+
+	function makeStarObject(node) {
+		if (!_planeGeo) {
+			_planeGeo = new THREE.PlaneGeometry(2, 2);
+			_hitGeo = new THREE.SphereGeometry(4, 6, 6);
+			// invisible but raycastable — clicks land on this, not the glow quad
+			_hitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false });
+		}
+		const mat = makeStarMaterial();
+		mat.uniforms.uScale.value = nodeBaseScale(node.pitch ?? 2048);
+		const star = new THREE.Mesh(_planeGeo, mat);
+		star.frustumCulled = false; // billboarded in-shader; default culling would clip at screen edges
+
+		const hit = new THREE.Mesh(_hitGeo, _hitMat);
+
+		const label = new SpriteText(labelFor(node), 1.8, C.textDim);
+		label.fontFace = 'monospace';
+		label.material.transparent = true;
+		label.material.depthWrite = false;
+		label.position.set(0, 5, 0);
+
+		const group = new THREE.Group();
+		group.add(hit);
+		group.add(star);
+		group.add(label);
+		node.__mat = mat;
+		node.__label = label;
+		return group;
+	}
+
+	// Push store data into the 3D graph, reusing node objects so positions
+	// (and the running simulation) survive incremental syncs.
+	function syncGraph(nodes, links) {
+		if (!graph3d) return;
+		const liveIds = new Set(nodes.map((n) => n.id));
+		for (const id of [...nodePool.keys()]) {
+			if (!liveIds.has(id)) nodePool.delete(id);
+		}
+		const gNodes = nodes.map((n) => {
+			let o = nodePool.get(n.id);
+			if (!o) {
+				// Spawn newcomers just outside the constellation and let the
+				// link forces reel them in — far less disruptive than the
+				// default spawn near the core.
+				let maxR = 80;
+				for (const e of nodePool.values()) {
+					const d = Math.hypot(e.x || 0, e.y || 0, e.z || 0);
+					if (d > maxR) maxR = d;
+				}
+				const th = Math.random() * Math.PI * 2;
+				const ph = Math.acos(2 * Math.random() - 1);
+				const r = maxR + 30;   // just past the edge — shorter glide, less pull on the flock
+				o = {
+					id: n.id,
+					__lastTrig: performance.now(), // born bright
+					x: r * Math.sin(ph) * Math.cos(th),
+					y: r * Math.sin(ph) * Math.sin(th),
+					z: r * Math.cos(ph)
+				};
+				nodePool.set(n.id, o);
+			}
+			o.pitch = n.pitch;
+			return o;
+		});
+		const gLinks = links
+			.filter((l) => l.source !== l.target) // self-links have zero length in 3D — skip rendering
+			.map((l) => ({ source: l.source, target: l.target, weight: l.weight, sourceId: l.source, targetId: l.target }));
+		graph3d.graphData({ nodes: gNodes, links: gLinks });
+		updateNodeStyles();
+	}
+
+	// Recolor sprites / link materials from interaction + playhead state.
+	// Opacity is owned by the anim loop (fade system) — this sets colors,
+	// flags, and re-triggers the fade for playing nodes.
+	function updateNodeStyles() {
+		if (!graph3d) return;
+		const now = performance.now();
+		for (const [id, n] of nodePool) {
+			const mat = n.__mat;
+			if (!mat) continue;
+			const isP1 = id === $currentNodeId;
+			const isP2 = id === $currentNode2Id;
+			const isFocusSource = focusedNodeId === id;
+			const isFocusTarget = focusedOutputTargets.has(id);
+			const isConnectSource = connectFromNode === id;
+			const color =
+				isP1 ? C.chain1 : isP2 ? C.chain2
+				: isConnectSource || isFocusSource ? C.focus
+				: isFocusTarget ? C.focusTarget : C.primary;
+			mat.uniforms.uColor.value.set(color);
+			if (n.__label) n.__label.color = (isP1 || isP2 || isFocusSource) ? color : C.textDim;
+			n.__orphan = !nodesWithInput.has(id) && !isFocusSource && !isFocusTarget;
+			n.__active = isP1 || isP2;
+			if (n.__active) n.__lastTrig = now;   // light back up + restart the fade
+		}
+		const gd = graph3d.graphData();
+		for (const l of gd.links) {
+			if (!l.__mat) continue;
+			const focused = focusedNodeId !== null && l.sourceId === focusedNodeId;
+			l.__mat.color.set(focused ? C.linkFocus : C.link);
+			l.__mat.opacity = focused ? 0.9 : 0.45;
+		}
+	}
+
+	// Per-frame: camera auto-orbit + auto-fit, star fades, playhead twinkle
+	function animLoop() {
+		const now = performance.now();
+		const t = now / 1000;
+		const dt = Math.min(0.1, lastAnimT ? t - lastAnimT : 0.016);
+		lastAnimT = t;
+
+		// Constellation bounding radius (also reused for auto-fit)
+		let maxR = 0;
+		for (const n of nodePool.values()) {
+			const d = Math.hypot(n.x || 0, n.y || 0, n.z || 0);
+			if (d > maxR) maxR = d;
+		}
+
+		// Slow orbit — azimuth spins steadily, elevation sways at its own
+		// rate — while the radius eases toward framing the whole network.
+		// Operates on the camera's current spherical position, so user zoom
+		// and manual rotation compose naturally (and pause interaction).
+		if (graph3d && !orbitPaused && THREE) {
+			const cam = graph3d.camera();
+			if (!_sph) _sph = new THREE.Spherical();
+			_sph.setFromVector3(cam.position);
+			_sph.theta += ORBIT_AZ_SPEED * dt;
+			_sph.phi += Math.sin(t * ORBIT_POL_RATE * 2 * Math.PI) * ORBIT_POL_AMP * dt;
+			_sph.phi = Math.max(0.35, Math.min(Math.PI - 0.35, _sph.phi));
+			if (maxR > 0) {
+				const fovV = (cam.fov * Math.PI) / 180;
+				const tanV = Math.tan(fovV / 2);
+				const tanH = tanV * cam.aspect;
+				const fitDist = Math.max(80, ((maxR + 14) / Math.min(tanV, tanH)) * FIT_PADDING);
+				_sph.radius += (fitDist - _sph.radius) * Math.min(1, dt * FIT_LERP);
+			}
+			cam.position.setFromSpherical(_sph);
+			cam.lookAt(0, 0, 0);
+		}
+
+		// Fades + twinkle (shader uniforms)
+		for (const n of nodePool.values()) {
+			const mat = n.__mat;
+			if (!mat) continue;
+			const base = nodeBaseScale(n.pitch ?? 2048);
+			let glow;
+			if (n.__active) {
+				glow = 1;
+				mat.uniforms.uScale.value = base * (1.5 + 0.3 * Math.sin(t * 6));
+			} else {
+				const age = (now - (n.__lastTrig || 0)) / 1000;
+				glow = 1 - Math.min(1, age / FADE_SECONDS) * (1 - MIN_GLOW);
+				mat.uniforms.uScale.value = base;
+			}
+			if (n.__orphan) glow *= 0.5;
+			mat.uniforms.uIntensity.value = glow;
+			mat.uniforms.uTime.value = t;
+			if (n.__label) n.__label.material.opacity = Math.max(0.1, glow * 0.8);
+		}
+
+		pulseFrameId = requestAnimationFrame(animLoop);
+	}
+
+	async function initGraph3d() {
+		const [{ default: ForceGraph3D }, three, spriteText] = await Promise.all([
+			import('3d-force-graph'),
+			import('three'),
+			import('three-spritetext')
+		]);
+		THREE = three;
+		SpriteText = spriteText.default;
+		starTexture = makeStarTexture();
+
+		graph3d = ForceGraph3D()(graphEl)
+			.backgroundColor('rgba(0,0,0,0)')
+			.showNavInfo(false)
+			.nodeThreeObject((node) => makeStarObject(node))
+			.nodeLabel((n) => `<span class="g3d-tip">[${String(n.id).padStart(3, '0')}] ${nodeLabels.get(n.id) || ''}</span>`)
+			.linkMaterial((link) => {
+				const mat = new THREE.LineDashedMaterial({
+					color: C.link,
+					transparent: true,
+					opacity: 0.45,
+					dashSize: 2.5,
+					gapSize: 2
+				});
+				link.__mat = mat;
+				return mat;
+			})
+			.linkPositionUpdate((obj, { start, end }) => {
+				// Custom update so LineDashedMaterial gets its line distances
+				const pos = obj.geometry?.getAttribute?.('position');
+				if (!pos) return false;
+				pos.setXYZ(0, start.x, start.y, start.z);
+				pos.setXYZ(1, end.x, end.y, end.z);
+				pos.needsUpdate = true;
+				obj.computeLineDistances();
+				return true;
+			})
+			.onNodeClick((node, ev) => {
+				graphClickTs = Date.now();
+				if (connectFromNode !== null) {
+					if (connectFromNode !== node.id) sendAddLink(connectFromNode, node.id);
+					connectFromNode = null;
+					contextMenu = null;
+					return;
+				}
+				focusedNodeId = node.id;
+				contextMenu = { x: ev.clientX, y: ev.clientY, type: 'node',
+					data: { id: node.id, pitch: node.pitch } };
+			})
+			.onLinkClick((link, ev) => {
+				graphClickTs = Date.now();
+				if (connectFromNode !== null) { connectFromNode = null; return; }
+				contextMenu = { x: ev.clientX, y: ev.clientY, type: 'link',
+					data: { sourceId: link.sourceId, targetId: link.targetId } };
+			})
+			.onNodeDragEnd((n) => {
+				// release after drag so the constellation stays organic
+				n.fx = n.fy = n.fz = undefined;
+			});
+
+		// Gentle physics: weak charge + soft links + heavy damping + slow
+		// cooling — arrivals glide in and neighbors barely stir
+		graph3d.d3Force('charge').strength(-45);
+		graph3d.d3Force('link').distance(35).strength(0.15);
+		graph3d.d3VelocityDecay(0.6);
+		graph3d.d3AlphaDecay(0.04);
+		graph3d.cameraPosition({ x: 0, y: 0, z: 220 });
+
+		// Deep-space backdrop: two shells of faint distant stars — parallax
+		// against the near constellation makes the orbit readable.
+		const scene = graph3d.scene();
+		const cam = graph3d.camera();
+		cam.far = 8000;
+		cam.updateProjectionMatrix();
+		for (const [count, rMin, rMax, size, opacity] of [
+			[700, 1000, 2200, 7, 0.75],
+			[200, 650, 1000, 11, 0.9]
+		]) {
+			const pos = new Float32Array(count * 3);
+			for (let i = 0; i < count; i++) {
+				const th = Math.random() * Math.PI * 2;
+				const ph = Math.acos(2 * Math.random() - 1);
+				const r = rMin + Math.random() * (rMax - rMin);
+				pos[i * 3]     = r * Math.sin(ph) * Math.cos(th);
+				pos[i * 3 + 1] = r * Math.sin(ph) * Math.sin(th);
+				pos[i * 3 + 2] = r * Math.cos(ph);
+			}
+			const geo = new THREE.BufferGeometry();
+			geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+			const mat = new THREE.PointsMaterial({
+				color: 0xffdf88,
+				size,
+				map: starTexture,
+				transparent: true,
+				opacity,
+				sizeAttenuation: true,
+				depthWrite: false,
+				blending: THREE.AdditiveBlending
+			});
+			const pts = new THREE.Points(geo, mat);
+			pts.raycast = () => {};   // backdrop must never intercept clicks
+			scene.add(pts);
+		}
+
+		// Pause the auto-orbit while the user is dragging/zooming; resume
+		// a few seconds after they let go.
+		const controls = graph3d.controls();
+		controls.addEventListener('start', () => {
+			orbitPaused = true;
+			clearTimeout(orbitResumeTimer);
+		});
+		controls.addEventListener('end', () => {
+			clearTimeout(orbitResumeTimer);
+			orbitResumeTimer = setTimeout(() => { orbitPaused = false; }, 4000);
+		});
+
+		syncGraph($graphNodes, $graphLinks);
+		pulseFrameId = requestAnimationFrame(animLoop);
 	}
 
 	// ═══════════════════════════════════════════════════════════
@@ -226,185 +554,27 @@
 	$: if (waveformSelect2El) waveformSelect2El.selectedIndex = $waveformIndex2;
 
 	// ═══════════════════════════════════════════════════════════
-	// Ring animation system
-	// ═══════════════════════════════════════════════════════════
-	let rings = [];
-	let traveler1 = null;
-	let traveler2 = null;
-	let _prevNode1 = -1;
-	let _prevNode2 = -1;
-	let lastPing1Time = 0;
-	let lastPing2Time = 0;
-	let animFrameId = null;
-	let animNow = 0;
-
-	function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
-
-	function addRing(nodeId, color, duration = RING_DUR_SLOW) {
-		rings = [...rings, { nodeId, color, start: performance.now(), duration }];
-	}
-
-	function onChainChange1(newId) {
-		if (newId === _prevNode1) return;
-		const oldId = _prevNode1;
-		_prevNode1 = newId;
-		if (newId < 0) { traveler1 = null; return; }
-		const toPos = positionMap.get(newId);
-		if (!toPos) return;
-		addRing(newId, C.chain1, RING_DUR_FAST);
-		lastPing1Time = performance.now();
-		const fromPos = oldId >= 0 ? positionMap.get(oldId) : null;
-		if (fromPos) {
-			traveler1 = {
-				sx: fromPos.x, sy: fromPos.y, ex: toPos.x, ey: toPos.y,
-				x: fromPos.x, y: fromPos.y, start: performance.now(),
-				color: C.chain1
-			};
-		}
-		ensureAnimLoop();
-	}
-
-	function onChainChange2(newId) {
-		if (newId === _prevNode2) return;
-		const oldId = _prevNode2;
-		_prevNode2 = newId;
-		if (newId < 0) { traveler2 = null; return; }
-		const toPos = positionMap.get(newId);
-		if (!toPos) return;
-		addRing(newId, C.chain2, RING_DUR_FAST);
-		lastPing2Time = performance.now();
-		const fromPos = oldId >= 0 ? positionMap.get(oldId) : null;
-		if (fromPos) {
-			traveler2 = {
-				sx: fromPos.x, sy: fromPos.y, ex: toPos.x, ey: toPos.y,
-				x: fromPos.x, y: fromPos.y, start: performance.now(),
-				color: C.chain2
-			};
-		}
-		ensureAnimLoop();
-	}
-
-	$: onChainChange1($currentNodeId);
-	$: onChainChange2($currentNode2Id);
-
-	function ensureAnimLoop() {
-		if (animFrameId) return;
-		animFrameId = requestAnimationFrame(animLoop);
-	}
-
-	$: if ($currentNodeId >= 0 || $currentNode2Id >= 0) ensureAnimLoop();
-
-	function animLoop() {
-		const now = performance.now();
-		animNow = now;
-
-		if (traveler1) {
-			const t = Math.min(1, (now - traveler1.start) / TRAVEL_DUR);
-			const e = easeOutCubic(t);
-			traveler1.x = traveler1.sx + (traveler1.ex - traveler1.sx) * e;
-			traveler1.y = traveler1.sy + (traveler1.ey - traveler1.sy) * e;
-			if (t >= 1) traveler1 = null;
-		}
-		if (traveler2) {
-			const t = Math.min(1, (now - traveler2.start) / TRAVEL_DUR);
-			const e = easeOutCubic(t);
-			traveler2.x = traveler2.sx + (traveler2.ex - traveler2.sx) * e;
-			traveler2.y = traveler2.sy + (traveler2.ey - traveler2.sy) * e;
-			if (t >= 1) traveler2 = null;
-		}
-
-		if (_prevNode1 >= 0 && now - lastPing1Time > PING_INTERVAL) {
-			addRing(_prevNode1, C.chain1, RING_DUR_SLOW);
-			lastPing1Time = now;
-		}
-		if (_prevNode2 >= 0 && now - lastPing2Time > PING_INTERVAL) {
-			addRing(_prevNode2, C.chain2, RING_DUR_SLOW);
-			lastPing2Time = now;
-		}
-
-		rings = rings.filter(r => (now - r.start) < r.duration);
-
-		if (traveler1) traveler1 = traveler1;
-		if (traveler2) traveler2 = traveler2;
-
-		const hasPlaying = _prevNode1 >= 0 || _prevNode2 >= 0;
-		if (traveler1 || traveler2 || rings.length > 0 || hasPlaying) {
-			animFrameId = requestAnimationFrame(animLoop);
-		} else {
-			animFrameId = null;
-		}
-	}
-
-	// ═══════════════════════════════════════════════════════════
 	// Resize
 	// ═══════════════════════════════════════════════════════════
 	function handleResize() {
-		if (!containerEl) return;
 		if (sidebarEl) sidebarW = sidebarEl.offsetWidth;
-		WIDTH = containerEl.clientWidth;
-		HEIGHT = containerEl.clientHeight;
-		if (simulation) {
-			simulation.force('center', forceCenter(WIDTH / 2, HEIGHT / 2));
-			simulation.alpha(0.3).restart();
+		if (graph3d && graphEl) {
+			graph3d.width(graphEl.clientWidth).height(graphEl.clientHeight);
 		}
 	}
 
 	// ═══════════════════════════════════════════════════════════
-	// Drag handlers
+	// Context menu (node/link clicks arrive via the 3D graph callbacks)
 	// ═══════════════════════════════════════════════════════════
-	function getSVGPoint(e) {
-		if (!svgEl) return { x: 0, y: 0 };
-		const pt = svgEl.createSVGPoint();
-		pt.x = e.clientX; pt.y = e.clientY;
-		return pt.matrixTransform(svgEl.getScreenCTM().inverse());
+	function dismissMenu() {
+		// Canvas clicks bubble up to the window handler right after the 3D
+		// library fires onNodeClick/onLinkClick — don't instantly close the
+		// menu those clicks just opened.
+		if (Date.now() - graphClickTs < 200) return;
+		contextMenu = null;
+		if (connectFromNode !== null) connectFromNode = null;
+		focusedNodeId = null;
 	}
-
-	function onNodeMouseDown(e, nodeId) {
-		if (e.button !== 0 || connectFromNode !== null) return;
-		e.preventDefault(); e.stopPropagation();
-		const sn = simNodes.find((n) => n.id === nodeId);
-		if (!sn) return;
-		dragNode = sn; didDrag = false; focusedNodeId = nodeId;
-		sn.fx = sn.x; sn.fy = sn.y;
-		if (simulation) simulation.alphaTarget(0.3).restart();
-		window.addEventListener('mousemove', onDragMove);
-		window.addEventListener('mouseup', onDragEnd);
-	}
-	function onDragMove(e) {
-		if (!dragNode) return;
-		didDrag = true;
-		const pt = getSVGPoint(e);
-		dragNode.fx = pt.x; dragNode.fy = pt.y;
-	}
-	function onDragEnd() {
-		if (!dragNode) return;
-		dragNode.fx = null; dragNode.fy = null; dragNode = null;
-		if (simulation) simulation.alphaTarget(0);
-		window.removeEventListener('mousemove', onDragMove);
-		window.removeEventListener('mouseup', onDragEnd);
-	}
-
-	// ═══════════════════════════════════════════════════════════
-	// Click / context menu
-	// ═══════════════════════════════════════════════════════════
-	function onNodeClick(e, node) {
-		if (didDrag) { didDrag = false; return; }
-		if (connectFromNode !== null) {
-			if (connectFromNode !== node.id) sendAddLink(connectFromNode, node.id);
-			connectFromNode = null; contextMenu = null; return;
-		}
-		e.preventDefault(); e.stopPropagation();
-		focusedNodeId = node.id;
-		contextMenu = { x: e.clientX, y: e.clientY, type: 'node',
-			data: { id: node.id, pitch: node.pitch } };
-	}
-	function onLinkClick(e, sourceId, targetId) {
-		if (connectFromNode !== null) { connectFromNode = null; return; }
-		e.preventDefault(); e.stopPropagation();
-		contextMenu = { x: e.clientX, y: e.clientY, type: 'link',
-			data: { sourceId, targetId } };
-	}
-	function dismissMenu() { contextMenu = null; if (connectFromNode !== null) connectFromNode = null; focusedNodeId = null; }
 	function handleDeleteNode(id) { sendDeleteNode(id); contextMenu = null; }
 	function handleConnectNode(id) { connectFromNode = id; contextMenu = null; }
 	function handleDeleteLink(s, t) { sendDeleteLink(s, t); contextMenu = null; }
@@ -425,161 +595,66 @@
 		? new Set($graphLinks.filter(l => l.source === focusedNodeId).map(l => l.target)) : new Set();
 	$: nodesWithInput = new Set($graphLinks.map(l => l.target));
 	$: nodeLabels = computeLabels(displayNodes, $scaleIndex);
-	$: if ($graphNodes || $graphLinks) updateSimulation($graphNodes, $graphLinks);
+	$: if (graph3d && ($graphNodes || $graphLinks)) syncGraph($graphNodes, $graphLinks);
+
+	// Restyle stars/links whenever playheads or interaction state change
+	$: if (graph3d && ($currentNodeId !== undefined || $currentNode2Id !== undefined
+		|| focusedNodeId !== undefined || connectFromNode !== undefined || nodesWithInput)) {
+		updateNodeStyles();
+	}
+
+	// Keep floating labels in sync with the scale (note names re-quantize)
+	$: if (graph3d && nodeLabels) {
+		for (const n of nodePool.values()) {
+			if (n.__label && n.__label.text !== labelFor(n)) n.__label.text = labelFor(n);
+		}
+	}
 
 	// Sort nodes by ID for the metadata list
 	$: sortedNodes = [...displayNodes].sort((a, b) => a.id - b.id);
 
 	let sidebarObserver = null;
+	let graphObserver = null;
 	onMount(() => {
-		positionMap.clear(); handleResize();
+		handleResize();
 		if (sidebarEl) {
 			sidebarObserver = new ResizeObserver(() => {
 				sidebarW = sidebarEl.offsetWidth;
 			});
 			sidebarObserver.observe(sidebarEl);
 		}
+		initGraph3d().then(() => {
+			if (graphEl) {
+				graphObserver = new ResizeObserver(() => {
+					if (graph3d) graph3d.width(graphEl.clientWidth).height(graphEl.clientHeight);
+				});
+				graphObserver.observe(graphEl);
+				graph3d.width(graphEl.clientWidth).height(graphEl.clientHeight);
+			}
+		});
 	});
 	onDestroy(() => {
-		if (simulation) simulation.stop();
-		if (animFrameId) cancelAnimationFrame(animFrameId);
+		if (pulseFrameId) cancelAnimationFrame(pulseFrameId);
+		clearTimeout(orbitResumeTimer);
 		if (sidebarObserver) sidebarObserver.disconnect();
-		window.removeEventListener('mousemove', onDragMove);
-		window.removeEventListener('mouseup', onDragEnd);
+		if (graphObserver) graphObserver.disconnect();
+		if (graph3d) { graph3d._destructor?.(); graph3d = null; }
 	});
 </script>
 
 <svelte:window on:click={dismissMenu} on:resize={handleResize} on:keydown={handleKeydown} />
 
 <div class="crt" bind:this={containerEl}>
-	<svg bind:this={svgEl} class="monitor" style="left: {effSidebarW}px; width: calc(100% - {effSidebarW}px);" viewBox="0 0 {WIDTH} {HEIGHT}">
-		<defs>
-			<pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-				<path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1a1500" stroke-width="0.5" />
-			</pattern>
-		</defs>
+	<!-- 3D star-field network -->
+	<div bind:this={graphEl} class="monitor"
+		style="left: {effSidebarW}px; width: calc(100% - {effSidebarW}px); cursor: {connectFromNode !== null ? 'crosshair' : 'default'};"></div>
 
-		<!-- Grid background -->
-		<rect width={WIDTH} height={HEIGHT} fill="url(#grid)" />
-
-		<!-- Range circles (radar style) -->
-		{#each [80, 160, 240] as r}
-			<circle cx={WIDTH / 2} cy={HEIGHT / 2} r={r}
-				fill="none" stroke="#1a1500" stroke-width="0.5" stroke-dasharray="4 8" />
-		{/each}
-
-		<!-- Crosshair -->
-		<line x1={WIDTH / 2} y1="0" x2={WIDTH / 2} y2={HEIGHT}
-			stroke="#1a1500" stroke-width="0.5" stroke-dasharray="8 8" />
-		<line x1="0" y1={HEIGHT / 2} x2={WIDTH} y2={HEIGHT / 2}
-			stroke="#1a1500" stroke-width="0.5" stroke-dasharray="8 8" />
-
-		<!-- Corner brackets -->
-		<g stroke={C.border} stroke-width="1" fill="none" opacity="0.4">
-			<polyline points="30,10 10,10 10,30" />
-			<polyline points="{WIDTH - 30},10 {WIDTH - 10},10 {WIDTH - 10},30" />
-			<polyline points="10,{HEIGHT - 30} 10,{HEIGHT - 10} 30,{HEIGHT - 10}" />
-			<polyline points="{WIDTH - 10},{HEIGHT - 30} {WIDTH - 10},{HEIGHT - 10} {WIDTH - 30},{HEIGHT - 10}" />
-		</g>
-
-		<!-- Expanding rings -->
-		{#each rings as ring}
-			{@const node = displayNodes.find(n => n.id === ring.nodeId)}
-			{#if node}
-				{@const age = Math.max(0, Math.min(1, (animNow - ring.start) / ring.duration))}
-				{@const radius = 6 + age * 40}
-				{@const opacity = 0.9 * (1 - age)}
-				<circle cx={node.x} cy={node.y} r={radius}
-					fill="none" stroke={ring.color} stroke-width="1.5"
-					opacity={opacity} pointer-events="none" />
-			{/if}
-		{/each}
-
-		<!-- Links -->
-		{#each displayLinks as link}
-			{@const isFocused = focusedNodeId !== null && link.sourceId === focusedNodeId}
-			{@const color = isFocused ? C.linkFocus : C.link}
-			{@const opacity = isFocused ? 0.8 : 0.5}
-			{#if link.sourceId === link.targetId}
-				{@const node = displayNodes.find((n) => n.id === link.sourceId)}
-				{#if node}
-					<path d={selfLoopPath(node.x, node.y)} fill="none" stroke="transparent"
-						stroke-width="14" style="cursor: pointer"
-						on:click|stopPropagation={(e) => onLinkClick(e, link.sourceId, link.targetId)} />
-					<path d={selfLoopPath(node.x, node.y)} fill="none"
-						stroke={color} stroke-width="0.8" opacity={opacity}
-						stroke-dasharray="4 4" pointer-events="none" />
-				{/if}
-			{:else}
-				<line x1={link.x1} y1={link.y1} x2={link.x2} y2={link.y2}
-					stroke="transparent" stroke-width="14" style="cursor: pointer"
-					on:click|stopPropagation={(e) => onLinkClick(e, link.sourceId, link.targetId)} />
-				<line x1={link.x1} y1={link.y1} x2={link.x2} y2={link.y2}
-					stroke={color} stroke-width="0.8" opacity={opacity}
-					stroke-dasharray="4 4" pointer-events="none" />
-			{/if}
-		{/each}
-
-		<!-- Nodes -->
-		{#each displayNodes as node}
-			{@const isFocusSource = focusedNodeId === node.id}
-			{@const isFocusTarget = focusedOutputTargets.has(node.id)}
-			{@const isOrphan = !nodesWithInput.has(node.id) && !isFocusSource && !isFocusTarget}
-			{@const isP1 = node.id === $currentNodeId}
-			{@const isP2 = node.id === $currentNode2Id}
-			{@const isPlaying = isP1 || isP2}
-			{@const fillColor = isP1 ? C.chain1 : isP2 ? C.chain2 : isFocusSource ? C.focus : isFocusTarget ? C.focusTarget : C.primary}
-			{@const r = nodeRadius(node.pitch)}
-			{@const isConnectSource = connectFromNode === node.id}
-			<g style="cursor: {connectFromNode !== null ? 'crosshair' : 'grab'}"
-				opacity={isOrphan ? 0.4 : 1}
-				on:mousedown|stopPropagation={(e) => onNodeMouseDown(e, node.id)}
-				on:click|stopPropagation={(e) => onNodeClick(e, node)}>
-				<!-- hit area -->
-				<circle cx={node.x} cy={node.y} r={NODE_HIT_R} fill="transparent" />
-				<!-- node dot -->
-				<circle cx={node.x} cy={node.y} r={r}
-					fill={isConnectSource ? C.focus : fillColor} />
-				<!-- crosshair on focused node -->
-				{#if isFocusSource}
-					<line x1={node.x - 16} y1={node.y} x2={node.x + 16} y2={node.y}
-						stroke={C.focus} stroke-width="0.5" opacity="0.5" />
-					<line x1={node.x} y1={node.y - 16} x2={node.x} y2={node.y + 16}
-						stroke={C.focus} stroke-width="0.5" opacity="0.5" />
-				{/if}
-			</g>
-			<!-- label -->
-			<text x={node.x + 12} y={node.y - 10} class="node-label"
-				fill={isP1 ? C.chain1 : isP2 ? C.chain2 : isFocusSource ? C.focus : C.textDim}
-				opacity={isOrphan ? 0.3 : 1}
-				pointer-events="none">{nodeLabels.get(node.id) || ''}</text>
-		{/each}
-
-		<!-- Traveling dots -->
-		{#if traveler1}
-			<circle cx={traveler1.x} cy={traveler1.y} r="3"
-				fill={traveler1.color} pointer-events="none" />
-		{/if}
-		{#if traveler2}
-			<circle cx={traveler2.x} cy={traveler2.y} r="3"
-				fill={traveler2.color} pointer-events="none" />
-		{/if}
-
-		<!-- Empty state -->
-		{#if !$midiConnected}
-			<text x={WIDTH / 2} y={HEIGHT / 2} text-anchor="middle"
-				fill={C.textDim} font-size="16"
-				font-family="'Monaspace Krypton', monospace">
-				NO SIGNAL — CONNECT TO MIDI
-			</text>
-		{:else if displayNodes.length === 0}
-			<text x={WIDTH / 2} y={HEIGHT / 2} text-anchor="middle"
-				fill={C.textDim} font-size="16"
-				font-family="'Monaspace Krypton', monospace">
-				NO SIGNAL — FLIP SWITCH UP TO CREATE NODES
-			</text>
-		{/if}
-	</svg>
+	<!-- Empty state overlay -->
+	{#if !$midiConnected}
+		<div class="empty-msg" style="left: {effSidebarW}px; width: calc(100% - {effSidebarW}px);">NO SIGNAL — CONNECT TO MIDI</div>
+	{:else if displayNodes.length === 0}
+		<div class="empty-msg" style="left: {effSidebarW}px; width: calc(100% - {effSidebarW}px);">NO SIGNAL — FLIP SWITCH UP TO CREATE NODES</div>
+	{/if}
 
 	<!-- CRT overlay layers -->
 	<div class="scanlines"></div>
@@ -612,7 +687,7 @@
 			{#if $midiConnected}
 				<button class="btn" on:click={requestPull}>↻ PULL</button>
 			{/if}
-			<button class="btn" on:click={() => (perfMode = true)} title="Show only the network (Esc to exit)">◱ PERF MODE</button>
+			<button class="btn" on:click={() => (perfMode = true)} title="Show only the network (Esc to exit)">◱ PERFORMANCE MODE</button>
 		</div>
 	</div>
 
@@ -746,7 +821,7 @@
 
 	<!-- ═══ Performance mode overlays ═══ -->
 	{#if perfMode}
-		<button class="perf-exit" on:click={() => (perfMode = false)} title="Exit performance mode (Esc)">✕</button>
+		<button class="perf-exit" on:click={() => (perfMode = false)} title="Exit performance mode (Esc)">◱</button>
 		<div class="perf-dot" class:on={$midiConnected} title={$midiConnected ? 'CONNECTED' : 'DISCONNECTED'}></div>
 	{/if}
 
@@ -767,7 +842,7 @@
 				</div>
 			</div>
 			<div class="bottom-ctrl">
-				<span class="ctrl-label">NODES</span>
+				<span class="ctrl-label">MAX NODES</span>
 				<div class="slider-row">
 					<input type="range" class="slider" min="2" max="64" step="1" value={$maxNodes} on:input={handleMaxNodesInput} on:change={handleMaxNodesChange}>
 					<span class="mv">{maxNodesDisplay}</span>
@@ -872,7 +947,7 @@
 	/* ═══ Performance mode ═══ */
 	.perf-hide { display: none !important; }
 	.perf-exit {
-		position: absolute; top: 12px; left: 12px; z-index: 60;
+		position: absolute; top: 8px; right: 8px; z-index: 60;
 		width: 28px; height: 28px;
 		background: transparent; border: 1px solid #332b00; color: #806600;
 		font-family: inherit; font-size: 13px; line-height: 1;
@@ -880,7 +955,7 @@
 	}
 	.perf-exit:hover { opacity: 1; color: #ffcc00; border-color: #ffcc00; }
 	.perf-dot {
-		position: absolute; top: 18px; right: 18px; z-index: 60;
+		position: absolute; top: 17px; right: 48px; z-index: 60;
 		width: 10px; height: 10px; border-radius: 50%;
 		background: #402020;
 	}
@@ -917,6 +992,25 @@
 		top: 0; bottom: 0; right: 0;
 		height: 100%;
 		display: block;
+		overflow: hidden;
+	}
+
+	.empty-msg {
+		position: absolute;
+		top: 50%;
+		transform: translateY(-50%);
+		text-align: center;
+		color: #aa8800;
+		font-size: 16px;
+		pointer-events: none;
+		z-index: 5;
+	}
+
+	/* Hover tooltip injected by 3d-force-graph */
+	:global(.scene-tooltip) {
+		font-family: 'Monaspace Krypton', monospace !important;
+		color: #ffcc00 !important;
+		font-size: 12px;
 	}
 
 	/* ═══ Header ═══ */

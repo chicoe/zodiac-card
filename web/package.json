@@ -16,7 +16,9 @@
   },
   "dependencies": {
     "@fontsource/monaspace-krypton": "^5.2.5",
-    "d3-force": "^3.0.0"
+    "3d-force-graph": "^1.80.0",
+    "d3-force": "^3.0.0",
+    "three-spritetext": "^1.10.0"
   },
   "type": "module"
 }

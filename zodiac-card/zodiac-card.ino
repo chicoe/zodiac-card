@@ -1,5 +1,5 @@
 /*
-  Chains Sequencer — Music Thing Modular Workshop System
+  Zodiac Card — Music Thing Modular Workshop System
   Markov chain sequencer: nodes with weighted links form a probabilistic graph.
   Two independent chains traverse the same graph with separate clocks.
 
@@ -45,11 +45,6 @@
 // ═══════════════════════════════════════════════════════════════════
 static constexpr int      MAX_NODES            = 64;  // hard array cap (indices must fit int8_t, IDs 0–126)
 static constexpr int      DEFAULT_MAX_NODES    = 16;  // default runtime cap (UI slider: 2..MAX_NODES)
-// Custom USB name strings were once suspected of breaking Windows MIDI and
-// were exonerated (real cause: the core's buffered MIDI write used a wrong
-// virtual cable number — see WebInterface.h writeBytes). Keep enabled.
-#define ZODIAC_CUSTOM_USB_NAME 1
-
 static constexpr int      REPAIR_SLICE         = 8;   // nodes processed per ISR tick during sliced graph ops.
                                                       // Kept small: USB preemption can add ~25µs to any sample
                                                       // (IRQ priorities are untouchable — see note in setup()),
@@ -245,10 +240,9 @@ public:
     bool    repairIncoming[MAX_NODES] = {};
 
     // Sliced delete link-fixup: after a swap-delete, the scan that removes
-    // links to the deleted slot / retargets links to the moved node runs 16
-    // nodes per tick (the full scan is ~500 link-touches on a dense 64-node
-    // graph ≈ 50µs — over budget in one sample). Between slices every link
-    // is index-valid; worst transient is a chain following a stale link once.
+    // links to the deleted slot / retargets links to the moved node runs a
+    // few nodes per tick (the full scan would blow the ISR budget). Between
+    // slices every link is index-valid; worst transient is one stale hop.
     int8_t  delFixSlot   = -1;    // slot the deleted node occupied (moved node now lives there); -1 = idle
     uint8_t delFixLast   = 0;     // old last index (now out of range; links there → delFixSlot)
     uint8_t delFixCursor = 0;
@@ -644,11 +638,8 @@ public:
     }
 
     // ───────────────────────────────────────────────────────────
-    // Incoming CC → fallback commands (runs on Core 1).
-    // Some Windows MIDI stacks drop browser→device SysEx while passing
-    // plain channel messages, which left the UI connected but unable to
-    // request the graph (empty network, working knobs). The browser sends
-    // CC 102 alongside the SysEx pull request; either one triggers a resync.
+    // Incoming CC → fallback commands (runs on Core 1). CC 102 is an
+    // alternate pull request for hosts that drop browser→device SysEx.
     // ───────────────────────────────────────────────────────────
     static constexpr uint8_t CC_IN_PULL_REQUEST = 102;
     void ProcessIncomingCC(uint8_t cc, uint8_t value) override {
@@ -938,13 +929,6 @@ public:
             nodes[i].linkCount = 1;
             nodes[i].synced = false;
         }
-    }
-
-    // Wrapper with seqlock for standalone cleanup calls
-    void cleanupStrayNodes() {
-        graphSeq++;
-        cleanupStrayNodesBody();
-        graphSeq++;
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -1917,21 +1901,11 @@ void setup() {
 
     card.nextMidiServiceTime = get_absolute_time();
     card.EnableNormalisationProbe();
-#if ZODIAC_CUSTOM_USB_NAME
     card.beginMIDI("Zodiac Card");
-#else
-    card.beginMIDI(nullptr);   // default USB names — Windows MIDI experiment
-#endif
 
-    // NOTE: do NOT touch core-0 IRQ priorities. Both directions were tried
-    // and BOTH kill the MIDI stream (card enumerates but never transmits):
-    //   - demoting USBCTRL_IRQ below the audio DMA (0xC0)   → dead stream
-    //   - raising DMA_IRQ_0 above USB (0x00, USB untouched) → dead stream
-    // The USB stack evidently requires its IRQ to outrank the audio DMA.
-    // Consequence: USB preemption adds ~20-25µs to occasional ProcessSample
-    // wall times (visible in ISR_SECT as inflated no-op sections). That tax
-    // is tolerable as long as REAL ISR work stays small — the ADC FIFO only
-    // overflows past ~62µs total — so keep per-sample graph ops minimal.
+    // Do NOT reorder core-0 IRQ priorities (any change kills the USB MIDI
+    // stream). USB therefore preempts ProcessSample by ~20-25µs at times;
+    // per-sample work must stay small enough to absorb that under ~62µs.
 }
 
 void loop() {

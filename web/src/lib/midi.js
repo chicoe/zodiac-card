@@ -421,8 +421,6 @@ function handleSysEx(data) {
 	}
 
 	if (payload[0] === MSG_NODE_DELETED && payload.length >= 2) {
-		// Explicit deletion from firmware — exact, replaces the old
-		// "evict lowest ID on count drop" guess
 		if (internalNodes.delete(payload[1])) rebuildGraph();
 		return;
 	}

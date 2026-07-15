@@ -7,7 +7,7 @@
 	import { connectMIDI, selectDevice, requestPull, sendDeleteNode, sendDeleteLink, sendAddLink, sendNoteOn, sendSetScale, sendSetAutoInterval, sendSetWaveform1, sendSetBassMode1, sendSetWaveform2, sendSetBassMode2, sendSetMaxNodes, setNoteTxChannel, setStatusRxChannel, isAutoDetectedName } from '$lib/midi.js';
 	import {
 		graphNodes, graphLinks, currentNodeId, currentNode2Id, nodeCount,
-		knobMain, knobX, knobY, switchState,
+		knobMain, knobY, switchState,
 		midiConnected, deviceNames, selectedDevice, scaleIndex, autoInterval,
 		waveformIndex1, bassMode1, waveformIndex2, bassMode2,
 		bpm1, bpm2, clockMode, clockMultLevel, isrPeakUs, isrSections, rxMsgCount, sysexRxCount,
@@ -725,7 +725,7 @@
 	<!-- ═══ Header bar ═══ -->
 	<div class="header" class:perf-hide={perfMode}>
 		<span class="title">ZODIAC SEQUENCER CARD</span>
-		<span class="subtitle"> | BETA v0.3.0</span>
+		<span class="subtitle"> | BETA v0.3.1</span>
 		<div class="hdr-rule"></div>
 		<div class="conn-bar">
 			<button class="btn" class:connected={$midiConnected} on:click={connectMIDI}>
@@ -766,7 +766,7 @@
 				<br/>
 				<br/>To install, download the .UF2 file below, save it to the card and connect via USB MIDI (Chrome only).
 			</div>
-			<a class="btn btn-dl" href="{base}/zodiac-card-v0.3.uf2" download>⬇ DOWNLOAD .UF2</a>
+			<a class="btn btn-dl" href="{base}/zodiac-card-v0.3.1.uf2" download>⬇ DOWNLOAD .UF2</a>
 		</details>
 
 		<details class="side-section" on:click={toggleDetails}>
@@ -1156,13 +1156,6 @@
 		margin-bottom: 10px;
 		/* flex-shrink: 0; */
 	}
-	.side-rule {
-		width: 196px;
-		border: none; height: 1px;
-		background: #2a2200;
-		margin: 4px 0;
-		display: none;
-	}
 	.side-title {
 		font-size: 11px; color: #aa8800;
 		letter-spacing: 2px; margin-bottom: 6px;
@@ -1457,7 +1450,6 @@
 		cursor: pointer;
 	}
 	.sel:focus { border-color: #ffcc00; outline: none; }
-	.sel-full { width: 100%; }
 	.sel-input {
 		color: #ff9955; border-color: #5a3000;
 	}
@@ -1475,12 +1467,6 @@
 	}
 
 	/* ═══ SVG Node labels ═══ */
-	.node-label {
-		font-family: 'Monaspace Krypton', monospace;
-		font-size: 13px; letter-spacing: 0.5px;
-		user-select: none;
-	}
-
 	/* ═══ Context menu ═══ */
 	.ctx-menu {
 		position: fixed;

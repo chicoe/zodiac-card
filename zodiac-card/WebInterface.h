@@ -21,10 +21,8 @@
 class WebInterfaceComputerCard : public ComputerCard
 {
 public:
-    // Call from setup() after EnableNormalisationProbe(), before Run()
-    // Pass nullptr to keep the core's default USB name strings: custom
-    // name descriptors are suspected of breaking device→host MIDI on
-    // Windows (see arduino-pico discussion #1244 — same core, unresolved).
+    // Call from setup() after EnableNormalisationProbe(), before Run().
+    // Pass nullptr to keep the core's default USB name strings.
     void beginMIDI(const char *name = "Zodiac Card")
     {
         if (name) {
@@ -40,13 +38,10 @@ public:
         ((WebInterfaceComputerCard *)ThisPtr())->USBCore();
     }
 
-    // All sends go byte-by-byte through MIDI_::write(uint8_t), NEVER through
-    // the buffered MIDI_::write(buffer, size): arduino-pico 5.6.1's buffered
-    // overload stamps packets with virtual cable number 1, but this device
-    // declares only cable 0. Windows' usbaudio silently DISCARDS packets
-    // with undeclared cable numbers (macOS forgives them), which made all
-    // device→host MIDI invisible on Windows. The single-byte overload uses
-    // cable 0 correctly; TinyUSB's stream writer packs identical packets.
+    // IMPORTANT: always send byte-by-byte via MIDI_::write(uint8_t), never
+    // the buffered MIDI_::write(buffer, size) — the buffered overload
+    // (arduino-pico ≤5.6.1) stamps packets with virtual cable 1, which this
+    // device doesn't declare, and Windows silently discards such packets.
     void writeBytes(const uint8_t *data, uint32_t size)
     {
         for (uint32_t i = 0; i < size; i++) {
@@ -136,9 +131,7 @@ public:
             }
             break;
         }
-        case 0x0B: // Control Change — channel 1 only. Used for fallback
-                   // commands: some Windows MIDI stacks drop browser→device
-                   // SysEx while passing plain channel messages.
+        case 0x0B: // Control Change — channel 1 only (fallback commands)
         {
             if ((pkt.byte1 & 0x0F) == 0) {
                 ProcessIncomingCC(pkt.byte2 & 0x7F, pkt.byte3 & 0x7F);

@@ -188,13 +188,16 @@
 
 	let _planeGeo = null, _hitGeo = null, _hitMat = null;
 
+	function ensureSharedGeos() {
+		if (_planeGeo) return;
+		_planeGeo = new THREE.PlaneGeometry(2, 2);
+		_hitGeo = new THREE.SphereGeometry(4, 6, 6);
+		// invisible but raycastable — clicks land on this, not the glow quad
+		_hitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false });
+	}
+
 	function makeStarObject(node) {
-		if (!_planeGeo) {
-			_planeGeo = new THREE.PlaneGeometry(2, 2);
-			_hitGeo = new THREE.SphereGeometry(4, 6, 6);
-			// invisible but raycastable — clicks land on this, not the glow quad
-			_hitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false });
-		}
+		ensureSharedGeos();
 		const mat = makeStarMaterial();
 		mat.uniforms.uScale.value = nodeBaseScale(node.pitch ?? 2048);
 		const star = new THREE.Mesh(_planeGeo, mat);
@@ -291,6 +294,44 @@
 		}
 	}
 
+	// ═══ Travelers — a small star flies from the chain's previous node to
+	// the newly triggered one, tracing the melody's path through the graph.
+	const TRAVEL_MS = 220;
+	let travelers = [];   // [chain1, chain2]
+
+	function makeTraveler(color) {
+		ensureSharedGeos();
+		const mat = makeStarMaterial();
+		mat.uniforms.uColor.value.set(color);
+		mat.uniforms.uScale.value = 3.5;
+		mat.uniforms.uIntensity.value = 1.2;
+		const mesh = new THREE.Mesh(_planeGeo, mat);
+		mesh.frustumCulled = false;
+		mesh.visible = false;
+		mesh.raycast = () => {};
+		graph3d.scene().add(mesh);
+		return { mesh, mat, fromN: null, toN: null, start: 0, flying: false, lastId: -1 };
+	}
+
+	function onChainMove(idx, newId) {
+		const tr = travelers[idx];
+		if (!tr) return;
+		const prevId = tr.lastId;
+		tr.lastId = newId;
+		if (newId < 0 || prevId < 0 || prevId === newId) return;
+		const from = nodePool.get(prevId);
+		const to = nodePool.get(newId);
+		if (!from || !to) return;
+		tr.fromN = from;
+		tr.toN = to;
+		tr.start = performance.now();
+		tr.flying = true;
+		tr.mesh.visible = true;
+	}
+
+	$: if (graph3d) onChainMove(0, $currentNodeId);
+	$: if (graph3d) onChainMove(1, $currentNode2Id);
+
 	// Per-frame: camera auto-orbit + auto-fit, star fades, playhead twinkle
 	function animLoop() {
 		const now = performance.now();
@@ -345,6 +386,25 @@
 			mat.uniforms.uIntensity.value = glow;
 			mat.uniforms.uTime.value = t;
 			if (n.__label) n.__label.material.opacity = Math.max(0.1, glow * 0.8);
+		}
+
+		// Travelers — ease along the live positions of their endpoints, so
+		// the flight path tracks nodes even while the layout drifts
+		for (const tr of travelers) {
+			if (!tr?.flying) continue;
+			const k = Math.min(1, (now - tr.start) / TRAVEL_MS);
+			const e = 1 - Math.pow(1 - k, 3);
+			const f = tr.fromN, g = tr.toN;
+			tr.mesh.position.set(
+				(f.x || 0) + ((g.x || 0) - (f.x || 0)) * e,
+				(f.y || 0) + ((g.y || 0) - (f.y || 0)) * e,
+				(f.z || 0) + ((g.z || 0) - (f.z || 0)) * e
+			);
+			tr.mat.uniforms.uTime.value = t;
+			if (k >= 1) {
+				tr.flying = false;
+				tr.mesh.visible = false;
+			}
 		}
 
 		pulseFrameId = requestAnimationFrame(animLoop);
@@ -464,6 +524,8 @@
 			clearTimeout(orbitResumeTimer);
 			orbitResumeTimer = setTimeout(() => { orbitPaused = false; }, 4000);
 		});
+
+		travelers = [makeTraveler(C.chain1), makeTraveler(C.chain2)];
 
 		syncGraph($graphNodes, $graphLinks);
 		pulseFrameId = requestAnimationFrame(animLoop);

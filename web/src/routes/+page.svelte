@@ -670,7 +670,9 @@
 
 		<details class="side-section" open on:click={toggleDetails}>
 			<summary class="side-title">STATUS</summary>
-			<div class="meta-row" title="All incoming MIDI messages, before any filtering"><span class="ml">MIDI_RX</span><span class="mv">{$rxMsgCount}</span></div>
+			{#if debugMode}
+				<div class="meta-row" title="All incoming MIDI messages, before any filtering"><span class="ml">MIDI_RX</span><span class="mv">{$rxMsgCount}</span></div>
+			{/if}
 			<div class="meta-row"><span class="ml">N_NODES</span><span class="mv">{String($nodeCount).padStart(2, '0')}</span></div>
 			<div class="meta-row"><span class="ml">SEQ1_ID</span><span class="mv c1">{$currentNodeId >= 0 ? String($currentNodeId).padStart(3, '0') : '---'}</span></div>
 			<div class="meta-row"><span class="ml">SEQ2_ID</span><span class="mv c2">{$currentNode2Id >= 0 ? String($currentNode2Id).padStart(3, '0') : '---'}</span></div>

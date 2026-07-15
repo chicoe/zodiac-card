@@ -22,10 +22,15 @@ class WebInterfaceComputerCard : public ComputerCard
 {
 public:
     // Call from setup() after EnableNormalisationProbe(), before Run()
+    // Pass nullptr to keep the core's default USB name strings: custom
+    // name descriptors are suspected of breaking device→host MIDI on
+    // Windows (see arduino-pico discussion #1244 — same core, unresolved).
     void beginMIDI(const char *name = "Zodiac Card")
     {
-        USB.setProduct(name);   // OS-level USB device name
-        MidiUSB.setName(name);  // MIDI jack name
+        if (name) {
+            USB.setProduct(name);   // OS-level USB device name
+            MidiUSB.setName(name);  // MIDI jack name
+        }
         MidiUSB.begin();
         multicore_launch_core1(core1);
     }
@@ -35,34 +40,48 @@ public:
         ((WebInterfaceComputerCard *)ThisPtr())->USBCore();
     }
 
+    // All sends go byte-by-byte through MIDI_::write(uint8_t), NEVER through
+    // the buffered MIDI_::write(buffer, size): arduino-pico 5.6.1's buffered
+    // overload stamps packets with virtual cable number 1, but this device
+    // declares only cable 0. Windows' usbaudio silently DISCARDS packets
+    // with undeclared cable numbers (macOS forgives them), which made all
+    // device→host MIDI invisible on Windows. The single-byte overload uses
+    // cable 0 correctly; TinyUSB's stream writer packs identical packets.
+    void writeBytes(const uint8_t *data, uint32_t size)
+    {
+        for (uint32_t i = 0; i < size; i++) {
+            MidiUSB.write(data[i]);
+        }
+    }
+
     void SendSysEx(uint8_t *data, uint32_t size)
     {
         uint8_t header[] = {0xF0, MIDI_MANUFACTURER_ID};
         uint8_t footer[] = {0xF7};
-        MidiUSB.write(header, 2);
-        MidiUSB.write(data, size);
-        MidiUSB.write(footer, 1);
+        writeBytes(header, 2);
+        writeBytes(data, size);
+        writeBytes(footer, 1);
         MidiUSB.flush();
     }
 
     void SendCC(uint8_t cc, uint8_t val)
     {
         uint8_t msg[] = {0xB0, (uint8_t)(cc & 0x7F), (uint8_t)(val & 0x7F)};
-        MidiUSB.write(msg, 3);
+        writeBytes(msg, 3);
         MidiUSB.flush();
     }
 
     void SendNoteOn(uint8_t channel, uint8_t note, uint8_t vel)
     {
         uint8_t msg[] = {(uint8_t)(0x90 | (channel & 0x0F)), (uint8_t)(note & 0x7F), (uint8_t)(vel & 0x7F)};
-        MidiUSB.write(msg, 3);
+        writeBytes(msg, 3);
         MidiUSB.flush();
     }
 
     void SendNoteOff(uint8_t channel, uint8_t note)
     {
         uint8_t msg[] = {(uint8_t)(0x80 | (channel & 0x0F)), (uint8_t)(note & 0x7F), 0};
-        MidiUSB.write(msg, 3);
+        writeBytes(msg, 3);
         MidiUSB.flush();
     }
 

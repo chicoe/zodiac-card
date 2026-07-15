@@ -45,6 +45,11 @@
 // ═══════════════════════════════════════════════════════════════════
 static constexpr int      MAX_NODES            = 64;  // hard array cap (indices must fit int8_t, IDs 0–126)
 static constexpr int      DEFAULT_MAX_NODES    = 16;  // default runtime cap (UI slider: 2..MAX_NODES)
+// Custom USB name strings were once suspected of breaking Windows MIDI and
+// were exonerated (real cause: the core's buffered MIDI write used a wrong
+// virtual cable number — see WebInterface.h writeBytes). Keep enabled.
+#define ZODIAC_CUSTOM_USB_NAME 1
+
 static constexpr int      REPAIR_SLICE         = 8;   // nodes processed per ISR tick during sliced graph ops.
                                                       // Kept small: USB preemption can add ~25µs to any sample
                                                       // (IRQ priorities are untouchable — see note in setup()),
@@ -1912,7 +1917,11 @@ void setup() {
 
     card.nextMidiServiceTime = get_absolute_time();
     card.EnableNormalisationProbe();
+#if ZODIAC_CUSTOM_USB_NAME
     card.beginMIDI("Zodiac Card");
+#else
+    card.beginMIDI(nullptr);   // default USB names — Windows MIDI experiment
+#endif
 
     // NOTE: do NOT touch core-0 IRQ priorities. Both directions were tried
     // and BOTH kill the MIDI stream (card enumerates but never transmits):
